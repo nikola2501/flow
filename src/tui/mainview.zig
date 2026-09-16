@@ -1909,11 +1909,15 @@ const cmds = struct {
     /// what you read is your own work, not everything that landed on the other
     /// branch since you left it.
     ///
+    /// Without an argument the ref is resolved from diff_default_ref_candidates,
+    /// see diff_against_ref_try_candidate.
+    ///
     /// Streams into the buffer the same way shell_execute_stream does, so a
     /// large diff arrives progressively instead of blocking until git is done.
     pub fn diff_against_ref(self: *Self, ctx: Ctx) Result {
-        var ref: []const u8 = "master";
-        _ = ctx.args.match(.{tp.extract(&ref)}) catch false;
+        var ref: []const u8 = undefined;
+        if (!(ctx.args.match(.{tp.extract(&ref)}) catch false))
+            return cmds.diff_against_ref_try_candidate(self, 0);
 
         var spec_buf: [512]u8 = undefined;
         const spec = std.fmt.bufPrint(&spec_buf, "{s}...HEAD", .{ref}) catch return error.Stop;
@@ -1978,9 +1982,79 @@ const cmds = struct {
         self.location_update_from_editor();
     }
     pub const diff_against_ref_meta: Meta = .{
-        .description = "Diff against a branch or ref (default master)",
+        .description = "Diff against a branch or ref (default: the remote's default branch)",
         .arguments = &.{.string},
     };
+
+    /// Where diff_against_ref looks for its default ref, most preferred first.
+    ///
+    /// origin/HEAD is what the remote calls its default branch, so it covers
+    /// master and main alike. The remote-tracking refs come before the local
+    /// branches on purpose: a local master only moves when someone pulls it, so
+    /// it tends to be stale, and diffing against a stale base shows everyone
+    /// else's commits since then as if they were yours.
+    const diff_default_ref_candidates = [_][]const u8{
+        "origin/HEAD",
+        "origin/master",
+        "origin/main",
+        "master",
+        "main",
+    };
+
+    /// Ask git whether candidate `index` exists. On success the resolved name
+    /// (`origin/HEAD` comes back as e.g. `origin/master`) is fed to
+    /// diff_against_ref; on failure the next candidate is tried. The chain runs
+    /// through commands rather than a loop because each git call is async and
+    /// reports back as a message.
+    fn diff_against_ref_try_candidate(self: *Self, index: usize) Result {
+        if (index >= diff_default_ref_candidates.len) {
+            const logger = log.logger("git");
+            defer logger.deinit();
+            logger.print_err("diff_against_ref", "no default ref found, pass one explicitly", .{});
+            return;
+        }
+
+        var argv: std.Io.Writer.Allocating = .init(self.allocator);
+        defer argv.deinit();
+        const writer = &argv.writer;
+        try cbor.writeArrayHeader(writer, 6);
+        try cbor.writeValue(writer, "git");
+        try cbor.writeValue(writer, "rev-parse");
+        try cbor.writeValue(writer, "--verify");
+        try cbor.writeValue(writer, "--quiet");
+        try cbor.writeValue(writer, "--abbrev-ref");
+        try cbor.writeValue(writer, diff_default_ref_candidates[index]);
+
+        const handlers = struct {
+            fn out(_: usize, parent: tp.pid_ref, _: []const u8, output: []const u8) void {
+                const ref = std.mem.trim(u8, output, " \t\r\n");
+                if (ref.len > 0)
+                    parent.send(.{ "cmd", "diff_against_ref", .{ref} }) catch {};
+            }
+            fn err(_: usize, _: tp.pid_ref, _: []const u8, _: []const u8) void {}
+            fn exit(context: usize, parent: tp.pid_ref, _: []const u8, _: []const u8, exit_code: i64) void {
+                if (exit_code != 0)
+                    parent.send(.{ "cmd", "diff_against_ref_next_candidate", .{context + 1} }) catch {};
+            }
+        };
+
+        try shell.execute(self.allocator, .{ .buf = argv.written() }, .{
+            .context = index,
+            .out = handlers.out,
+            .err = handlers.err,
+            .exit = handlers.exit,
+        });
+    }
+
+    /// Continuation of diff_against_ref_try_candidate. No description, so the
+    /// command palette does not list it.
+    pub fn diff_against_ref_next_candidate(self: *Self, ctx: Ctx) Result {
+        var index: usize = undefined;
+        if (!try ctx.args.match(.{tp.extract(&index)}))
+            return error.InvalidArgument;
+        return cmds.diff_against_ref_try_candidate(self, index);
+    }
+    pub const diff_against_ref_next_candidate_meta: Meta = .{ .arguments = &.{.integer} };
 
     /// Enter, in a diff buffer: open the file the cursor is standing in, at the
     /// line the cursor is standing on.
