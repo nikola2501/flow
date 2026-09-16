@@ -28,7 +28,26 @@
             ["<Space>wm", "toggle_centered_view"],
             ["<Space>wo", "close_splits"],
             ["<Space>wq", "close_split"],
-            ["<Space>wv", "add_split"]
+            ["<Space>wv", "add_split"],
+
+            ["<C-S-1>", "goto_buffer", 1],
+            ["<C-S-2>", "goto_buffer", 2],
+            ["<C-S-3>", "goto_buffer", 3],
+            ["<C-S-4>", "goto_buffer", 4],
+            ["<C-S-5>", "goto_buffer", 5],
+            ["<C-S-6>", "goto_buffer", 6],
+            ["<C-S-7>", "goto_buffer", 7],
+            ["<C-S-8>", "goto_buffer", 8],
+            ["<C-S-9>", "goto_buffer", 9],
+            ["<A-1>", "goto_buffer", 1],
+            ["<A-2>", "goto_buffer", 2],
+            ["<A-3>", "goto_buffer", 3],
+            ["<A-4>", "goto_buffer", 4],
+            ["<A-5>", "goto_buffer", 5],
+            ["<A-6>", "goto_buffer", 6],
+            ["<A-7>", "goto_buffer", 7],
+            ["<A-8>", "goto_buffer", 8],
+            ["<A-9>", "goto_buffer", 9]
         ]
     },
     "normal": {

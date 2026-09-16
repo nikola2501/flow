@@ -2056,6 +2056,35 @@ const cmds = struct {
     }
     pub const diff_against_ref_next_candidate_meta: Meta = .{ .arguments = &.{.integer} };
 
+    /// Jump to the nth buffer, counting from 1.
+    ///
+    /// The order is the one switch_buffers shows, most recently used first, so
+    /// the numbers name rows in a list you can actually look at -- there is no
+    /// tab bar here to read them off. 1 is the buffer you are in and 2 is the
+    /// one you came from, which makes 2 a toggle between the last two files.
+    pub fn goto_buffer(self: *Self, ctx: Ctx) Result {
+        var n: usize = 0;
+        if (!try ctx.args.match(.{tp.extract(&n)})) return error.InvalidArgument;
+        if (n == 0) return;
+
+        const buffers = try self.buffer_manager.list_most_recently_used(self.allocator);
+        defer self.allocator.free(buffers);
+        if (n > buffers.len) {
+            const logger = log.logger("buffer");
+            defer logger.deinit();
+            logger.print("no buffer {d}, {d} open", .{ n, buffers.len });
+            return;
+        }
+
+        const file_path = buffers[n - 1].get_file_path();
+        if (file_path.len == 0) return;
+        try tp.self_pid().send(.{ "cmd", "navigate", .{ .file = file_path } });
+    }
+    pub const goto_buffer_meta: Meta = .{
+        .description = "Jump to a buffer by number",
+        .arguments = &.{.integer},
+    };
+
     /// Enter, in a diff buffer: open the file the cursor is standing in, at the
     /// line the cursor is standing on.
     ///
