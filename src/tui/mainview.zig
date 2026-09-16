@@ -1931,11 +1931,20 @@ const cmds = struct {
         const buffer = editor.buffer orelse return error.Stop;
         const buffer_ref = buffer.to_ref();
 
+        // -C the project directory rather than trusting the cwd: flow can be
+        // pointed at a project with -p from anywhere, and the paths in the
+        // output have to come from the same repository goto_diff_location
+        // resolves them against.
+        const project = tp.env.get().str("project");
         var argv: std.Io.Writer.Allocating = .init(self.allocator);
         defer argv.deinit();
         const writer = &argv.writer;
-        try cbor.writeArrayHeader(writer, 4);
+        try cbor.writeArrayHeader(writer, if (project.len > 0) 6 else 4);
         try cbor.writeValue(writer, "git");
+        if (project.len > 0) {
+            try cbor.writeValue(writer, "-C");
+            try cbor.writeValue(writer, project);
+        }
         try cbor.writeValue(writer, "--no-optional-locks");
         try cbor.writeValue(writer, "diff");
         try cbor.writeValue(writer, spec);
@@ -2063,7 +2072,18 @@ const cmds = struct {
             }
         }
 
-        try tp.self_pid().send(.{ "cmd", "navigate", .{ .file = file, .line = @as(i64, @intCast(target)) } });
+        // git writes paths relative to the repository root, while navigate
+        // resolves them against the project directory. Those are the same
+        // directory only when flow was launched at the top of the repo, so
+        // make the path absolute instead of hoping.
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const target_file = if (repo_root(tp.env.get().str("project"), &root_buf)) |repo|
+            std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ repo, file }) catch file
+        else
+            file;
+
+        try tp.self_pid().send(.{ "cmd", "navigate", .{ .file = target_file, .line = @as(i64, @intCast(target)) } });
     }
     pub const goto_diff_location_meta: Meta = .{
         .description = "Open the file under the cursor in a diff",
@@ -2072,6 +2092,23 @@ const cmds = struct {
 
     fn fallthrough(name: []const u8, ctx: Ctx) Result {
         return command.executeName(name, .empty_from(ctx));
+    }
+
+    /// Walk up from `dir` looking for a `.git` entry. It may be a directory or,
+    /// in a worktree or submodule, a file -- statFile finds either.
+    fn repo_root(dir: []const u8, buf: []u8) ?[]const u8 {
+        if (dir.len == 0) return null;
+        var end = dir.len;
+        while (end > 0) {
+            var probe: [std.fs.max_path_bytes]u8 = undefined;
+            const git = std.fmt.bufPrint(&probe, "{s}/.git", .{dir[0..end]}) catch return null;
+            if (std.Io.Dir.cwd().statFile(root.get_io(), git, .{})) |_| {
+                return copy(buf, dir[0..end]);
+            } else |_| {
+                end = std.mem.lastIndexOfScalar(u8, dir[0..end], '/') orelse return null;
+            }
+        }
+        return null;
     }
 
     fn copy(buf: []u8, src: []const u8) ?[]const u8 {
