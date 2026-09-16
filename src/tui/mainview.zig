@@ -1973,6 +1973,125 @@ const cmds = struct {
         .arguments = &.{.string},
     };
 
+    /// Enter, in a diff buffer: open the file the cursor is standing in, at the
+    /// line the cursor is standing on.
+    ///
+    /// In any other buffer this is just smart_insert_line, so the one Enter
+    /// binding keeps its ordinary meaning everywhere else.
+    ///
+    /// The line number is counted, not read: a hunk header gives the first line
+    /// in the new file, and every context or added row below it advances by one
+    /// while removed rows do not, because they are not in the new file at all.
+    pub fn goto_diff_location(self: *Self, ctx: Ctx) Result {
+        // Every keymap binds Enter to something already, and that something
+        // differs: smart_insert_line in flow, move_down in vim. Take it as the
+        // argument rather than guessing, so one binding can front for both.
+        var fallback: []const u8 = "smart_insert_line";
+        _ = ctx.args.match(.{tp.extract(&fallback)}) catch false;
+
+        const editor = self.get_active_editor() orelse return fallthrough(fallback, ctx);
+        const buffer = editor.buffer orelse return fallthrough(fallback, ctx);
+        const file_type = buffer.file_type_name orelse return fallthrough(fallback, ctx);
+        if (!buffer.ephemeral or !std.mem.eql(u8, file_type, "diff")) return fallthrough(fallback, ctx);
+        const buf_root = buffer.root;
+        const cursor_row = editor.get_primary().cursor.row;
+
+        var line: std.Io.Writer.Allocating = .init(self.allocator);
+        defer line.deinit();
+        const read = struct {
+            fn f(l: *std.Io.Writer.Allocating, r: anytype, row: usize, metrics: anytype) []const u8 {
+                l.clearRetainingCapacity();
+                r.get_line(row, &l.writer, metrics) catch return "";
+                return l.written();
+            }
+        }.f;
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path: ?[]const u8 = null;
+        var hunk_row: ?usize = null;
+        var hunk_line: usize = 1;
+
+        var row = cursor_row + 1;
+        while (row > 0 and path == null) {
+            row -= 1;
+            const text = read(&line, buf_root, row, editor.metrics);
+            if (std.mem.startsWith(u8, text, "diff --git ")) {
+                // Standing in a file header, above the first hunk: the nearest
+                // +++ line belongs to the *previous* file, so read the path here
+                // and settle for line 1.
+                if (std.mem.lastIndexOf(u8, text, " b/")) |i|
+                    path = copy(&path_buf, text[i + 3 ..]);
+                break;
+            }
+            if (hunk_row == null and std.mem.startsWith(u8, text, "@@")) {
+                hunk_line = parse_hunk_new_start(text) orelse continue;
+                hunk_row = row;
+                continue;
+            }
+            // A body line adding text that itself starts with "++ " would look
+            // like a header, so require the --- line that always precedes one.
+            if (std.mem.startsWith(u8, text, "+++ ") and row > 0 and
+                std.mem.startsWith(u8, read(&line, buf_root, row - 1, editor.metrics), "--- "))
+            {
+                const p = read(&line, buf_root, row, editor.metrics)[4..];
+                if (std.mem.eql(u8, p, "/dev/null")) {
+                    const logger = log.logger("diff");
+                    defer logger.deinit();
+                    logger.print("file was deleted in this diff", .{});
+                    return;
+                }
+                path = copy(&path_buf, if (std.mem.startsWith(u8, p, "b/")) p[2..] else p);
+            }
+        }
+
+        const file = path orelse return;
+
+        var target = hunk_line;
+        if (hunk_row) |hr| {
+            var r = hr + 1;
+            while (r < cursor_row) : (r += 1) {
+                const text = read(&line, buf_root, r, editor.metrics);
+                // An empty line is an empty context line; git omits the space.
+                if (text.len == 0) {
+                    target += 1;
+                } else switch (text[0]) {
+                    ' ', '+' => target += 1,
+                    '-', '\\' => {},
+                    // A new file header means the hunk ended above the cursor.
+                    else => break,
+                }
+            }
+        }
+
+        try tp.self_pid().send(.{ "cmd", "navigate", .{ .file = file, .line = @as(i64, @intCast(target)) } });
+    }
+    pub const goto_diff_location_meta: Meta = .{
+        .description = "Open the file under the cursor in a diff",
+        .arguments = &.{.string},
+    };
+
+    fn fallthrough(name: []const u8, ctx: Ctx) Result {
+        return command.executeName(name, .empty_from(ctx));
+    }
+
+    fn copy(buf: []u8, src: []const u8) ?[]const u8 {
+        if (src.len == 0 or src.len > buf.len) return null;
+        @memcpy(buf[0..src.len], src);
+        return buf[0..src.len];
+    }
+
+    /// "@@ -12,7 +34,9 @@ trailing" -> 34
+    fn parse_hunk_new_start(text: []const u8) ?usize {
+        const plus = std.mem.indexOfScalar(u8, text, '+') orelse return null;
+        var rest = text[plus + 1 ..];
+        const end = std.mem.indexOfAny(u8, rest, ",  @") orelse rest.len;
+        rest = rest[0..end];
+        const n = std.fmt.parseInt(usize, rest, 10) catch return null;
+        // A hunk that adds at the very top of a file reports +0 for an empty
+        // new side; line 0 does not exist, so clamp.
+        return if (n == 0) 1 else n;
+    }
+
     pub fn shell_execute_stream_output(self: *Self, ctx: Ctx) Result {
         var buffer_ref: Buffer.Ref = undefined;
         var output: []const u8 = undefined;

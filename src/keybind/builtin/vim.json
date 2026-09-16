@@ -63,7 +63,7 @@
             ["$", "move_end"],
             ["<Home>", "move_begin"],
             ["<End>", "move_end"],
-            ["<CR>", ["move_down"], ["move_begin"]],
+            ["<CR>", ["goto_diff_location", "move_down"], ["move_begin"]],
             ["<C-CR>", ["move_down"], ["move_begin"]],
             ["+", ["move_down"], ["move_begin"]],
             ["-", ["move_up"], ["move_begin"]],

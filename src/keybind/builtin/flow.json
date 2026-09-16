@@ -248,7 +248,7 @@
             ["ctrl+.", "completion"],
             ["f34", "toggle_whitespace_mode"],
             ["escape", "cancel"],
-            ["enter", "smart_insert_line"],
+            ["enter", "goto_diff_location", "smart_insert_line"],
             ["delete", "delete_forward"],
             ["backspace", "smart_delete_backward"],
             ["left", "move_left"],
