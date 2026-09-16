@@ -1903,6 +1903,76 @@ const cmds = struct {
     }
     pub const shell_execute_stream_meta: Meta = .{ .arguments = &.{.string} };
 
+    /// Open `git diff <ref>...HEAD` in a read-only scratch buffer.
+    ///
+    /// Three dots rather than two: the comparison is against the merge base, so
+    /// what you read is your own work, not everything that landed on the other
+    /// branch since you left it.
+    ///
+    /// Streams into the buffer the same way shell_execute_stream does, so a
+    /// large diff arrives progressively instead of blocking until git is done.
+    pub fn diff_against_ref(self: *Self, ctx: Ctx) Result {
+        var ref: []const u8 = "master";
+        _ = ctx.args.match(.{tp.extract(&ref)}) catch false;
+
+        var spec_buf: [512]u8 = undefined;
+        const spec = std.fmt.bufPrint(&spec_buf, "{s}...HEAD", .{ref}) catch return error.Stop;
+        var name_buf: [512]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "*diff {s}*", .{spec}) catch return error.Stop;
+
+        // The scratch buffer has to exist before git starts: its ref is what the
+        // output handler streams into, and `diff` gives it tree-sitter
+        // highlighting for free. create_editor first, the way open_help does, so
+        // the command also works from the home screen with nothing open yet.
+        tui.reset_drag_context();
+        try self.create_editor(ctx.now);
+        try command.executeName("open_scratch_buffer", command.fmt(.{ name, "", "diff" }));
+        const editor = self.get_active_editor() orelse return error.Stop;
+        const buffer = editor.buffer orelse return error.Stop;
+        const buffer_ref = buffer.to_ref();
+
+        var argv: std.Io.Writer.Allocating = .init(self.allocator);
+        defer argv.deinit();
+        const writer = &argv.writer;
+        try cbor.writeArrayHeader(writer, 4);
+        try cbor.writeValue(writer, "git");
+        try cbor.writeValue(writer, "--no-optional-locks");
+        try cbor.writeValue(writer, "diff");
+        try cbor.writeValue(writer, spec);
+
+        const handlers = struct {
+            fn out(context: usize, parent: tp.pid_ref, _: []const u8, output: []const u8) void {
+                const ref_: Buffer.Ref = @enumFromInt(context);
+                parent.send(.{ "cmd", "shell_execute_stream_output", .{ ref_, output } }) catch {};
+            }
+            fn exit(context: usize, parent: tp.pid_ref, _: []const u8, err_msg: []const u8, exit_code: i64) void {
+                const ref_: Buffer.Ref = @enumFromInt(context);
+                // A bad ref exits non-zero having written nothing, which would
+                // otherwise leave an empty buffer and no reason for it.
+                if (exit_code > 0) {
+                    var buf: [512]u8 = undefined;
+                    var stream: std.Io.Writer = .fixed(&buf);
+                    stream.print("git diff failed: {s}\n", .{err_msg}) catch {};
+                    parent.send(.{ "cmd", "shell_execute_stream_output", .{ ref_, stream.buffered() } }) catch {};
+                }
+                parent.send(.{ "cmd", "shell_execute_stream_output_complete", .{ref_} }) catch {};
+            }
+        };
+
+        try shell.execute(self.allocator, .{ .buf = argv.written() }, .{
+            .context = @intFromEnum(buffer_ref),
+            .out = handlers.out,
+            .err = handlers.out,
+            .exit = handlers.exit,
+        });
+        tui.need_render(@src());
+        self.location_update_from_editor();
+    }
+    pub const diff_against_ref_meta: Meta = .{
+        .description = "Diff against a branch or ref (default master)",
+        .arguments = &.{.string},
+    };
+
     pub fn shell_execute_stream_output(self: *Self, ctx: Ctx) Result {
         var buffer_ref: Buffer.Ref = undefined;
         var output: []const u8 = undefined;
