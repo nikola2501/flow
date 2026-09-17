@@ -6,6 +6,206 @@ and is my daily driver for almost everything.
 [![Announcement](https://img.youtube.com/vi/Mf3k2uFkyK4/maxresdefault.jpg)](https://www.youtube.com/watch?v=Mf3k2uFkyK4)
 
 
+
+# About this fork
+
+This is a personal fork of [neurocyte/flow](https://github.com/neurocyte/flow),
+kept for my own use rather than for upstream pull requests. It adds
+git-review and code-navigation features I missed coming from another editor.
+Everything below is additive: no upstream command or binding changes meaning.
+The one exception is Enter, which learns to jump from diff buffers and does
+exactly what it did before everywhere else.
+
+The fork lives on the `diff-against-ref` branch.
+
+## What the fork adds
+
+| Feature | Command | flow keys | vim keys |
+|---|---|---|---|
+| Diff against a branch | `diff_against_ref [ref]` | palette | palette |
+| Jump from a diff line to the source | `goto_diff_location` | `enter` in a diff buffer | `<CR>` in a diff buffer |
+| Changed files list | `show_changed_files [ref]` | `ctrl+alt+c` | `<Space>gc` |
+| All changed hunks | `show_vcs_hunks [ref]` | `ctrl+alt+h` | `<Space>gh` |
+| Project diagnostics | `show_project_diagnostics` | `ctrl+alt+m` | `<Space>sD` |
+| Call hierarchy, incoming | `show_incoming_calls` | `ctrl+shift+f12` | `<Space>ci` |
+| Call hierarchy, outgoing | `show_outgoing_calls` | `ctrl+alt+f12` | `<Space>co` |
+| Line blame in the browser | `open_vcs_blame_in_browser` | `alt+shift+b` | `<Space>gb` |
+| Jump to buffer by number | `goto_buffer N` | `ctrl+shift+1..9` | `ctrl+shift+1..9`, `alt+1..9` |
+| Source preview beside file lists | automatic | | |
+
+Commands that take `[ref]` can be run from the command palette with an
+argument, or bound with one, for example `["ctrl+k ctrl+d", "diff_against_ref", "main"]`.
+
+### Diff against a branch
+
+`diff_against_ref` opens `git diff <ref>...HEAD` in a read-only scratch buffer
+with diff highlighting. Three dots, so the comparison starts at the merge base:
+it shows this branch's own work, not what landed on the other branch since.
+The output streams in as git produces it.
+
+Without an argument the ref is resolved from `origin/HEAD`, `origin/master`,
+`origin/main`, `master`, `main`, in that order. Remote-tracking refs come first
+because a local `master` that nobody pulled sits behind the remote, and a merge
+base against it reaches back past the fork point.
+
+In a fork of someone else's repository `origin` is your copy and may be the stale
+one. Pass the ref explicitly there, for example `diff_against_ref upstream/master`.
+
+### Jump from a diff to the source
+
+Enter on a line of any diff buffer (`diff_against_ref`, `show_changed_files`)
+opens the file at that line. The line number is counted from the hunk header:
+context and added lines advance it, removed lines do not. On a removed line the
+jump lands where that line used to be. Paths are resolved against the git
+repository root, so this works when flow was started in a subdirectory.
+
+In every other buffer Enter runs the command it ran before. The keymap passes
+that command as the argument: `smart_insert_line` in the flow keymap, and
+`move_down` followed by `move_begin` in vim.
+
+If your own `~/.config/flow/keys/flow.json` defines the `normal` mode, it
+replaces the fork's Enter binding. Use the same form there:
+
+```json
+["enter", "goto_diff_location", "smart_insert_line"]
+```
+
+### Changed files
+
+`show_changed_files` lists each changed file once. A row shows the status (`A`
+added, `M` modified, `R` renamed, `D` deleted), the added and removed line
+counts, and the first changed line. Enter opens that file's diff, and Enter in
+the diff continues to the source.
+
+Without an argument the list compares the working tree against `HEAD`, staged
+and unstaged changes included. With a ref it uses `git diff --merge-base <ref>`:
+the comparison starts where the branch left the ref and includes uncommitted work.
+Line numbers match the files as they are on disk. Untracked files are not part of
+`git diff` and are not listed.
+
+### All changed hunks
+
+`show_vcs_hunks` lists every hunk in the repository. A row shows the file, the
+first changed line, the added and removed counts, and git's function context.
+Enter opens the hunk. It accepts the same optional ref as `show_changed_files`.
+
+### Project diagnostics
+
+Upstream `show_diagnostics` covers only the active file. The fork keeps every
+diagnostic the language servers publish, per file, including files that are not
+open. `show_project_diagnostics` lists them all. While the panel is open it
+updates as the servers publish, but it never opens by itself.
+
+The list is only as complete as the servers make it. Many analyse only files
+they were told about. flow also does not tell servers when an unopened file
+changes on disk, so those entries update only after the file is opened or saved
+in flow.
+
+### Call hierarchy
+
+`show_incoming_calls` opens a tree rooted at the function under the cursor,
+with its callers below. `show_outgoing_calls` shows the functions it calls
+instead. The keys work as follows:
+
+- Right expands a node and loads its children on demand.
+- Left collapses a node, or moves to its parent.
+- Enter jumps to the call site, or to the definition for the root.
+- Typing filters the tree.
+
+A row shows the call site and, when there is more than one, the number of calls.
+
+The language server must support call hierarchy. gopls, clangd and
+rust-analyzer do. ols (Odin) does not, and flow says so.
+
+### Line blame in the browser
+
+`open_vcs_blame_in_browser` traces the line under the cursor to the commit that
+last changed it. It opens that commit's blame page on the `origin` remote, at the
+file path and line number from that commit, so the link stays correct after
+renames and after lines above it moved. Lines changed locally have no commit and
+open nothing.
+
+GitHub and GitLab URLs are supported. Remotes can be `git@host:owner/repo`,
+`ssh://user@host[:port]/owner/repo`, or `https://`. The page opens with `open` on
+macOS and `xdg-open` elsewhere.
+
+### Jump to a buffer by number
+
+`goto_buffer N` switches to the Nth open buffer, counted in the order buffers
+were opened, like tabs:
+
+- Visiting a buffer does not renumber the others.
+- Closing a buffer shifts the later numbers down by one.
+- A reopened buffer goes to the end.
+- Sessions store buffers in this order.
+
+`ctrl+<digit>` still focuses splits. `ctrl+shift+<digit>` needs a terminal with
+the kitty keyboard protocol. Most macOS terminals do not have it, and there
+`alt+<digit>` works in the vim keymap. The flow keymap already uses `alt+<digit>`
+for numeric arguments.
+
+### Source preview beside file lists
+
+File lists in the bottom panel show the code around the selected row to the
+right of the list: find in files, references, diagnostics, project diagnostics,
+hunks and changed files. The preview has line numbers and syntax highlighting,
+centres the target line and highlights it, and follows the selection.
+
+- **Text source:** an open buffer supplies its text, including unsaved edits.
+  Other files are read from disk, up to 2 MiB.
+- **Binary and oversized files:** the preview shows a note instead of text.
+- **Narrow panels:** below 100 columns the preview is hidden and the list uses the
+  full width.
+- **Caching:** each file is loaded and parsed once per path. Edits made while the
+  list stays on that file appear after you move to another file.
+
+## Where the code lives
+
+| Area | Files |
+|---|---|
+| Diff, changed files, hunks, blame, project diagnostics, buffer numbers | `src/tui/mainview.zig` (commands in `cmds`, state fields on the view) |
+| Call hierarchy requests | `src/LSP.zig` (`send_request_raw`), `src/LSPClient.zig`, `src/Project.zig`, `src/project_manager.zig` |
+| Call hierarchy tree | `src/tui/mode/overlay/call_hierarchy_palette.zig`, left/right hooks in `palette.zig` |
+| Source preview | `src/tui/FilePreview.zig`, layout in `src/tui/filelist_view.zig` |
+| Buffer open order | `src/buffer/Buffer.zig` (`open_seq`), `src/buffer/Manager.zig` |
+| New list kinds | `src/tui/FileList.zig` |
+| Diff row mapping to HEAD | `src/tui/editor.zig` (`head_row_for`) |
+| Bindings | `src/keybind/builtin/flow.json`, `src/keybind/builtin/vim.json` |
+
+Git and language-server work runs in the background: git as child processes
+through `shell.execute`, and LSP requests through the existing language-server
+actors. Results stream back as messages. The source preview is the exception:
+the first time it shows a file, it reads and parses that file on the UI thread.
+
+## Keeping up with upstream
+
+```sh
+git remote add upstream https://github.com/neurocyte/flow.git   # once
+git config rerere.enabled true                                  # once: git remembers resolved conflicts
+
+git fetch upstream
+git checkout diff-against-ref
+git merge upstream/master
+zig build && zig build test
+```
+
+Merge rather than rebase. A merge resolves conflicts once for the whole range.
+A rebase replays each fork commit and can raise the same conflict in several of
+them.
+
+The fork is about 2,000 added lines in 16 files, with 8 upstream lines changed.
+Two files are entirely new, and most of the rest is new code added at the end of
+existing blocks. Conflicts therefore tend to be small: a field or import added
+next to a line upstream also touched. The resolution is usually to keep both
+sides.
+
+Expect more work from upstream refactors than from textual conflicts. Flow is
+under active development, and a rewrite of an API the fork calls, such as the
+panel system or `add_filelist_entry`, can merge cleanly and then fail to compile.
+Always build after merging. The files upstream changes most often are
+`src/tui/tui.zig`, `src/tui/mainview.zig`, `src/tui/editor.zig` and
+`src/keybind/builtin/flow.json`.
+
 # Features
 
 - **Lightning Fast** TUI with ≤6ms frame times, **low latency** input
