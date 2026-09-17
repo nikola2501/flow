@@ -20,6 +20,7 @@
             ["<Space>cs", "show_symbols"],
 
             ["<Space>gs", "show_vcs_status"],
+            ["<Space>gh", "show_vcs_hunks"],
 
             ["<Space>sd", "show_diagnostics"],
             ["<Space>sD", "show_project_diagnostics"],

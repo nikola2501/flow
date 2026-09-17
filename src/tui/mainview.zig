@@ -72,6 +72,12 @@ filelists: FileList.Manager = undefined,
 /// diagnostics panel is rebuilt from whichever file was published last, so
 /// neither can answer "what is wrong across the project".
 project_diagnostics: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(StoredDiagnostic)) = .empty,
+/// State of the running show_vcs_hunks, which parses git's output as it streams
+/// in. The generation discards output from a run that a newer one replaced.
+hunks_generation: usize = 0,
+hunks_root: std.ArrayListUnmanaged(u8) = .empty,
+hunks_file: std.ArrayListUnmanaged(u8) = .empty,
+hunks_count: usize = 0,
 symbols: std.ArrayListUnmanaged(u8) = .empty,
 symbols_complete: bool = true,
 closing_project: bool = false,
@@ -166,6 +172,8 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     self.lsp_info.deinit();
     self.filelists.deinit();
     self.project_diagnostics_clear_all();
+    self.hunks_root.deinit(allocator);
+    self.hunks_file.deinit(allocator);
     self.store_last_match_text(null);
     allocator.destroy(self);
 }
@@ -1858,6 +1866,167 @@ const cmds = struct {
             try self.project_diagnostics_add_entry(list.list_id, kv.key_ptr.*, d, .foreground);
     }
     pub const show_project_diagnostics_meta: Meta = .{ .description = "Show diagnostics for the whole project" };
+
+    /// Every changed region in the repository as one list, file by file.
+    ///
+    /// Without an argument the changes are the working tree against HEAD,
+    /// staged and unstaged alike. With a ref they are measured from where this
+    /// branch left that ref (git diff --merge-base), and still against the
+    /// working tree -- so the line numbers are the ones in the files you have
+    /// open, not in some committed version of them.
+    ///
+    /// -U0 keeps each hunk to the changed lines themselves, which is what makes
+    /// its header line number the place to jump to.
+    pub fn show_vcs_hunks(self: *Self, ctx: Ctx) Result {
+        var ref: []const u8 = "";
+        _ = ctx.args.match(.{tp.extract(&ref)}) catch false;
+
+        const project = tp.env.get().str("project");
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const repo = cmds.repo_root(project, &root_buf) orelse {
+            const logger = log.logger("hunks");
+            defer logger.deinit();
+            logger.print("not inside a git repository", .{});
+            return;
+        };
+
+        self.hunks_generation += 1;
+        self.hunks_count = 0;
+        self.hunks_file.clearRetainingCapacity();
+        self.hunks_root.clearRetainingCapacity();
+        try self.hunks_root.appendSlice(self.allocator, repo);
+
+        const list = try self.filelists.get_or_create_singleton(.hunks);
+        self.clear_find_in_files_results(list.list_id);
+
+        var argv: std.Io.Writer.Allocating = .init(self.allocator);
+        defer argv.deinit();
+        const writer = &argv.writer;
+        try cbor.writeArrayHeader(writer, if (ref.len > 0) 8 else 7);
+        try cbor.writeValue(writer, "git");
+        try cbor.writeValue(writer, "-C");
+        try cbor.writeValue(writer, repo);
+        try cbor.writeValue(writer, "--no-optional-locks");
+        try cbor.writeValue(writer, "diff");
+        try cbor.writeValue(writer, "-U0");
+        if (ref.len > 0) {
+            try cbor.writeValue(writer, "--merge-base");
+            try cbor.writeValue(writer, ref);
+        } else {
+            try cbor.writeValue(writer, "HEAD");
+        }
+
+        const handlers = struct {
+            fn out(context: usize, parent: tp.pid_ref, _: []const u8, output: []const u8) void {
+                parent.send(.{ "cmd", "vcs_hunks_output", .{ context, output } }) catch {};
+            }
+            fn err(_: usize, _: tp.pid_ref, _: []const u8, output: []const u8) void {
+                const logger = log.logger("hunks");
+                defer logger.deinit();
+                logger.print("{s}", .{std.mem.trimEnd(u8, output, "\n")});
+            }
+            fn exit(context: usize, parent: tp.pid_ref, _: []const u8, _: []const u8, exit_code: i64) void {
+                parent.send(.{ "cmd", "vcs_hunks_done", .{ context, exit_code } }) catch {};
+            }
+        };
+        try shell.execute(self.allocator, .{ .buf = argv.written() }, .{
+            .context = self.hunks_generation,
+            .out = handlers.out,
+            .err = handlers.err,
+            .exit = handlers.exit,
+        });
+    }
+    pub const show_vcs_hunks_meta: Meta = .{
+        .description = "Show all changed hunks (optionally against a ref)",
+        .arguments = &.{.string},
+    };
+
+    /// A batch of complete lines from show_vcs_hunks' git diff. Private
+    /// continuation: no description, so the palette does not list it.
+    pub fn vcs_hunks_output(self: *Self, ctx: Ctx) Result {
+        var generation: usize = 0;
+        var output: []const u8 = undefined;
+        if (!try ctx.args.match(.{ tp.extract(&generation), tp.extract(&output) })) return error.InvalidArgument;
+        if (generation != self.hunks_generation) return;
+        const list = self.filelists.find_by_kind(.hunks) orelse return;
+
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "diff --git ")) {
+                self.hunks_file.clearRetainingCapacity();
+            } else if (std.mem.startsWith(u8, line, "--- a/") and self.hunks_file.items.len == 0) {
+                // Remembered in case the new side is /dev/null: a deleted file
+                // still has a path worth listing.
+                try self.hunks_file.appendSlice(self.allocator, line[6..]);
+            } else if (std.mem.startsWith(u8, line, "+++ b/")) {
+                self.hunks_file.clearRetainingCapacity();
+                try self.hunks_file.appendSlice(self.allocator, line[6..]);
+            } else if (std.mem.startsWith(u8, line, "@@ ") and self.hunks_file.items.len > 0) {
+                const hunk = parse_hunk_header(line) orelse continue;
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const full = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ self.hunks_root.items, self.hunks_file.items }) catch continue;
+                // Relative to the project where it can be, the way the other
+                // lists show paths; navigate resolves either form.
+                var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const path = project_manager.normalize_file_path(full, &rel_buf);
+                var text_buf: [512]u8 = undefined;
+                const text = std.fmt.bufPrint(&text_buf, "+{d} -{d}  {s}", .{ hunk.added, hunk.removed, hunk.context }) catch continue;
+                // A pure deletion reports the line before the gap, which is 0
+                // when it removed the top of the file.
+                const at = @max(1, hunk.new_start);
+                try self.add_filelist_entry(list.list_id, path, at, 1, at, 1, text, .Information, .foreground);
+                self.hunks_count += 1;
+            }
+        }
+    }
+    pub const vcs_hunks_output_meta: Meta = .{ .arguments = &.{ .integer, .string } };
+
+    pub fn vcs_hunks_done(self: *Self, ctx: Ctx) Result {
+        var generation: usize = 0;
+        var exit_code: i64 = 0;
+        if (!try ctx.args.match(.{ tp.extract(&generation), tp.extract(&exit_code) })) return error.InvalidArgument;
+        if (generation != self.hunks_generation) return;
+        const logger = log.logger("hunks");
+        defer logger.deinit();
+        if (exit_code != 0)
+            logger.print("git diff failed with exit code {d}", .{exit_code})
+        else if (self.hunks_count == 0)
+            logger.print("no changes", .{})
+        else
+            logger.print("{d} hunks", .{self.hunks_count});
+    }
+    pub const vcs_hunks_done_meta: Meta = .{ .arguments = &.{ .integer, .integer } };
+
+    const HunkHeader = struct { new_start: usize, added: usize, removed: usize, context: []const u8 };
+
+    /// "@@ -12,3 +14,0 @@ fn name()" -> new_start 14, added 0, removed 3,
+    /// context "fn name()". An omitted count means one line.
+    fn parse_hunk_header(line: []const u8) ?HunkHeader {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = fields.next() orelse return null; // @@
+        const old = fields.next() orelse return null;
+        const new = fields.next() orelse return null;
+        if (old.len < 2 or old[0] != '-' or new.len < 2 or new[0] != '+') return null;
+        const old_range = parse_range(old[1..]) orelse return null;
+        const new_range = parse_range(new[1..]) orelse return null;
+        const close = std.mem.indexOfPos(u8, line, 2, "@@") orelse return null;
+        return .{
+            .new_start = new_range[0],
+            .added = new_range[1],
+            .removed = old_range[1],
+            .context = std.mem.trim(u8, line[close + 2 ..], " "),
+        };
+    }
+
+    fn parse_range(text: []const u8) ?[2]usize {
+        if (std.mem.indexOfScalar(u8, text, ',')) |comma| {
+            const start = std.fmt.parseInt(usize, text[0..comma], 10) catch return null;
+            const count = std.fmt.parseInt(usize, text[comma + 1 ..], 10) catch return null;
+            return .{ start, count };
+        }
+        const start = std.fmt.parseInt(usize, text, 10) catch return null;
+        return .{ start, 1 };
+    }
 
     pub fn open_previous_file(self: *Self, _: Ctx) Result {
         self.show_file_async(self.get_next_mru_buffer(.all) orelse return error.Stop);
