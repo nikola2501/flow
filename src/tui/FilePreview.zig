@@ -153,6 +153,7 @@ pub fn render(self: *Self, plane: *Plane, box: Widget.Box, theme: *const Widget.
         const row_bg = if (is_target) theme.editor_line_highlight.bg orelse theme.editor_selection.bg else base.bg;
 
         plane.cursor_move_yx(@intCast(y), @intCast(box.x + 1));
+        plane.set_styles(.{});
         plane.set_style(.{ .fg = if (is_target) theme.editor_gutter_active.fg else gutter_style.fg, .bg = row_bg });
         _ = plane.print("{d: >[1]} ", .{ line + 1, digits + 1 }) catch {};
 
@@ -166,6 +167,9 @@ pub fn render(self: *Self, plane: *Plane, box: Widget.Box, theme: *const Widget.
             const byte_style = styles[line_start - window_start + i];
             var style: Widget.Theme.Style = byte_style orelse .{ .fg = base.fg };
             style.bg = row_bg;
+            // set_style only ever adds attributes -- an underlined or bold token
+            // would otherwise carry on into every character after it.
+            plane.set_styles(.{});
             plane.set_style(style);
             if (text[i] == '\t') {
                 const spaces = tab_width - (col % tab_width);
