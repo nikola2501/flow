@@ -49,6 +49,7 @@
             ["ctrl+alt+m", "show_project_diagnostics"],
             ["ctrl+alt+h", "show_vcs_hunks"],
             ["alt+shift+b", "open_vcs_blame_in_browser"],
+            ["ctrl+alt+c", "show_changed_files"],
             ["ctrl+alt+home", "grow_panel"],
             ["ctrl+shift+alt+home", "grow_panel", 3],
             ["ctrl+alt+end", "shrink_panel"],

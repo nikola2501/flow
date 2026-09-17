@@ -8,7 +8,7 @@ pub const ActivateMode = enum { normal, alternate };
 pub const State = enum { idle, adding, done };
 
 pub const Id = usize;
-pub const Kind = enum { diagnostics, project_diagnostics, references, find_in_files, terminal_links, hunks };
+pub const Kind = enum { diagnostics, project_diagnostics, references, find_in_files, terminal_links, hunks, changed_files };
 
 pub const Stream = usize;
 
@@ -54,6 +54,7 @@ pub fn icon_for(kind: Kind) []const u8 {
         .find_in_files => "󰥨",
         .terminal_links => "",
         .hunks => "",
+        .changed_files => "",
     };
 }
 
@@ -65,6 +66,7 @@ fn label_for(kind: Kind) []const u8 {
         .find_in_files => "Find",
         .terminal_links => "Links",
         .hunks => "Hunks",
+        .changed_files => "Changes",
     };
 }
 

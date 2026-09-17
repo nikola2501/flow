@@ -391,6 +391,14 @@ fn handle_menu_action(menu: **MenuType, button: *ButtonType, _: Widget.Pos) void
     self.update_selected();
     const entry = &fl.entries.items[idx];
 
+    // A changed-files row is about the change, not the file: open its diff.
+    // The diff buffer's own Enter then leads on to the source.
+    if (fl.kind == .changed_files) {
+        self.activate = .normal;
+        tp.self_pid().send(.{ "cmd", "diff_changed_file", .{entry.path} }) catch |e| self.logger.err("diff_changed_file", e);
+        return;
+    }
+
     const cmd_ = switch (self.activate) {
         .normal => "navigate",
         .alternate => "navigate_split_vertical",

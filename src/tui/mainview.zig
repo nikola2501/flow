@@ -82,6 +82,14 @@ hunks_count: usize = 0,
 /// exits. Same generation scheme as the hunk list.
 blame_web_generation: usize = 0,
 blame_web_output: std.ArrayListUnmanaged(u8) = .empty,
+/// State of the running show_changed_files, which folds git diff's output
+/// into one row per file as it streams in.
+changes_generation: usize = 0,
+changes_count: usize = 0,
+changes_root: std.ArrayListUnmanaged(u8) = .empty,
+changes_ref: std.ArrayListUnmanaged(u8) = .empty,
+changes_path: std.ArrayListUnmanaged(u8) = .empty,
+changes_file: ChangedFile = .{},
 symbols: std.ArrayListUnmanaged(u8) = .empty,
 symbols_complete: bool = true,
 closing_project: bool = false,
@@ -179,8 +187,54 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     self.hunks_root.deinit(allocator);
     self.hunks_file.deinit(allocator);
     self.blame_web_output.deinit(allocator);
+    self.changes_root.deinit(allocator);
+    self.changes_ref.deinit(allocator);
+    self.changes_path.deinit(allocator);
     self.store_last_match_text(null);
     allocator.destroy(self);
+}
+
+const ChangedFile = struct {
+    open: bool = false,
+    status: u8 = 'M',
+    added: usize = 0,
+    removed: usize = 0,
+    first_line: usize = 0,
+};
+
+/// Emit the row for the file show_changed_files has been folding, if any.
+fn changed_files_flush(self: *Self) !void {
+    defer {
+        self.changes_file = .{};
+        self.changes_path.clearRetainingCapacity();
+    }
+    if (!self.changes_file.open or self.changes_path.items.len == 0) return;
+    const list = self.filelists.find_by_kind(.changed_files) orelse return;
+    const f = self.changes_file;
+
+    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ self.changes_root.items, self.changes_path.items }) catch return;
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = project_manager.normalize_file_path(full, &rel_buf);
+
+    var text_buf: [128]u8 = undefined;
+    const status_name = switch (f.status) {
+        'A' => "added",
+        'D' => "deleted",
+        'R' => "renamed",
+        else => "modified",
+    };
+    const text = std.fmt.bufPrint(&text_buf, "{c}  +{d} -{d}  {s}", .{ f.status, f.added, f.removed, status_name }) catch return;
+    // Colour by status through the severity the list already knows how to
+    // draw: added blue, modified and renamed yellow, deleted red.
+    const severity: ed.Diagnostic.Severity = switch (f.status) {
+        'A' => .Information,
+        'D' => .Error,
+        else => .Warning,
+    };
+    const at = @max(1, f.first_line);
+    try self.add_filelist_entry(list.list_id, path, at, 1, at, 1, text, severity, .foreground);
+    self.changes_count += 1;
 }
 
 const StoredDiagnostic = struct {
@@ -2391,10 +2445,25 @@ const cmds = struct {
         var name_buf: [512]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "*diff {s}*", .{spec}) catch return error.Stop;
 
-        // The scratch buffer has to exist before git starts: its ref is what the
-        // output handler streams into, and `diff` gives it tree-sitter
-        // highlighting for free. create_editor first, the way open_help does, so
-        // the command also works from the home screen with nothing open yet.
+        // -C the project directory rather than trusting the cwd: flow can be
+        // pointed at a project with -p from anywhere, and the paths in the
+        // output have to come from the same repository goto_diff_location
+        // resolves them against.
+        return stream_git_into_scratch(self, ctx, name, tp.env.get().str("project"), &.{ "diff", spec });
+    }
+    pub const diff_against_ref_meta: Meta = .{
+        .description = "Diff against a branch or ref (default: the remote's default branch)",
+        .arguments = &.{.string},
+    };
+
+    /// Open a read-only diff scratch buffer named `name` and stream
+    /// `git -C dir --no-optional-locks <args>` into it.
+    ///
+    /// The scratch buffer has to exist before git starts: its ref is what the
+    /// output handler streams into, and `diff` gives it tree-sitter highlighting
+    /// for free. create_editor first, the way open_help does, so this also works
+    /// from the home screen with nothing open yet.
+    fn stream_git_into_scratch(self: *Self, ctx: Ctx, name: []const u8, dir: []const u8, args: []const []const u8) Result {
         tui.reset_drag_context();
         try self.create_editor(ctx.now);
         try command.executeName("open_scratch_buffer", command.fmt(.{ name, "", "diff" }));
@@ -2402,23 +2471,17 @@ const cmds = struct {
         const buffer = editor.buffer orelse return error.Stop;
         const buffer_ref = buffer.to_ref();
 
-        // -C the project directory rather than trusting the cwd: flow can be
-        // pointed at a project with -p from anywhere, and the paths in the
-        // output have to come from the same repository goto_diff_location
-        // resolves them against.
-        const project = tp.env.get().str("project");
         var argv: std.Io.Writer.Allocating = .init(self.allocator);
         defer argv.deinit();
         const writer = &argv.writer;
-        try cbor.writeArrayHeader(writer, if (project.len > 0) 6 else 4);
+        try cbor.writeArrayHeader(writer, args.len + if (dir.len > 0) @as(usize, 4) else 2);
         try cbor.writeValue(writer, "git");
-        if (project.len > 0) {
+        if (dir.len > 0) {
             try cbor.writeValue(writer, "-C");
-            try cbor.writeValue(writer, project);
+            try cbor.writeValue(writer, dir);
         }
         try cbor.writeValue(writer, "--no-optional-locks");
-        try cbor.writeValue(writer, "diff");
-        try cbor.writeValue(writer, spec);
+        for (args) |arg| try cbor.writeValue(writer, arg);
 
         const handlers = struct {
             fn out(context: usize, parent: tp.pid_ref, _: []const u8, output: []const u8) void {
@@ -2448,10 +2511,154 @@ const cmds = struct {
         tui.need_render(@src());
         self.location_update_from_editor();
     }
-    pub const diff_against_ref_meta: Meta = .{
-        .description = "Diff against a branch or ref (default: the remote's default branch)",
+
+    /// Every changed file as a list: status, added and removed line counts,
+    /// and the first changed line, which the preview shows and which is where
+    /// the source opens. Enter opens that file's diff instead of the file.
+    ///
+    /// Without an argument the changes are the working tree against HEAD;
+    /// with a ref they are measured from where this branch left it and include
+    /// uncommitted work (git diff --merge-base), like show_vcs_hunks. Untracked
+    /// files are not part of a git diff and do not appear.
+    pub fn show_changed_files(self: *Self, ctx: Ctx) Result {
+        var ref: []const u8 = "";
+        _ = ctx.args.match(.{tp.extract(&ref)}) catch false;
+
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const repo = cmds.repo_root(tp.env.get().str("project"), &root_buf) orelse {
+            const logger = log.logger("changes");
+            defer logger.deinit();
+            logger.print("not inside a git repository", .{});
+            return;
+        };
+
+        self.changes_generation += 1;
+        self.changes_count = 0;
+        self.changes_file = .{};
+        self.changes_path.clearRetainingCapacity();
+        self.changes_root.clearRetainingCapacity();
+        try self.changes_root.appendSlice(self.allocator, repo);
+        self.changes_ref.clearRetainingCapacity();
+        try self.changes_ref.appendSlice(self.allocator, ref);
+
+        const list = try self.filelists.get_or_create_singleton(.changed_files);
+        var label_buf: [256]u8 = undefined;
+        list.set_label(if (ref.len > 0) std.fmt.bufPrint(&label_buf, "Changes vs {s}", .{ref}) catch "Changes" else "Changes") catch {};
+        self.clear_find_in_files_results(list.list_id);
+
+        var argv: std.Io.Writer.Allocating = .init(self.allocator);
+        defer argv.deinit();
+        const writer = &argv.writer;
+        try cbor.writeArrayHeader(writer, if (ref.len > 0) 8 else 7);
+        for ([_][]const u8{ "git", "-C", repo, "--no-optional-locks", "diff", "-U0" }) |arg| try cbor.writeValue(writer, arg);
+        if (ref.len > 0) {
+            try cbor.writeValue(writer, "--merge-base");
+            try cbor.writeValue(writer, ref);
+        } else {
+            try cbor.writeValue(writer, "HEAD");
+        }
+
+        const handlers = struct {
+            fn out(context: usize, parent: tp.pid_ref, _: []const u8, output: []const u8) void {
+                parent.send(.{ "cmd", "changed_files_output", .{ context, output } }) catch {};
+            }
+            fn err(_: usize, _: tp.pid_ref, _: []const u8, output: []const u8) void {
+                const logger = log.logger("changes");
+                defer logger.deinit();
+                logger.print("{s}", .{std.mem.trimEnd(u8, output, "\n")});
+            }
+            fn exit(context: usize, parent: tp.pid_ref, _: []const u8, _: []const u8, exit_code: i64) void {
+                parent.send(.{ "cmd", "changed_files_done", .{ context, exit_code } }) catch {};
+            }
+        };
+        try shell.execute(self.allocator, .{ .buf = argv.written() }, .{
+            .context = self.changes_generation,
+            .out = handlers.out,
+            .err = handlers.err,
+            .exit = handlers.exit,
+        });
+    }
+    pub const show_changed_files_meta: Meta = .{
+        .description = "Show changed files (optionally against a ref)",
         .arguments = &.{.string},
     };
+
+    pub fn changed_files_output(self: *Self, ctx: Ctx) Result {
+        var generation: usize = 0;
+        var output: []const u8 = undefined;
+        if (!try ctx.args.match(.{ tp.extract(&generation), tp.extract(&output) })) return error.InvalidArgument;
+        if (generation != self.changes_generation) return;
+
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "diff --git ")) {
+                try self.changed_files_flush();
+                self.changes_file = .{ .open = true };
+                // The b/ side is the path if nothing later overrides it: a
+                // rename or mode change without content has no +++ line.
+                if (std.mem.lastIndexOf(u8, line, " b/")) |i| try self.changes_path.appendSlice(self.allocator, line[i + 3 ..]);
+            } else if (!self.changes_file.open) {
+                continue;
+            } else if (std.mem.startsWith(u8, line, "new file mode")) {
+                self.changes_file.status = 'A';
+            } else if (std.mem.startsWith(u8, line, "deleted file mode")) {
+                self.changes_file.status = 'D';
+            } else if (std.mem.startsWith(u8, line, "rename to ")) {
+                self.changes_file.status = 'R';
+                self.changes_path.clearRetainingCapacity();
+                try self.changes_path.appendSlice(self.allocator, line["rename to ".len..]);
+            } else if (std.mem.startsWith(u8, line, "+++ b/")) {
+                self.changes_path.clearRetainingCapacity();
+                try self.changes_path.appendSlice(self.allocator, line[6..]);
+            } else if (std.mem.startsWith(u8, line, "@@ ")) {
+                const hunk = parse_hunk_header(line) orelse continue;
+                if (self.changes_file.first_line == 0) self.changes_file.first_line = @max(1, hunk.new_start);
+                self.changes_file.added += hunk.added;
+                self.changes_file.removed += hunk.removed;
+            }
+        }
+    }
+    pub const changed_files_output_meta: Meta = .{ .arguments = &.{ .integer, .string } };
+
+    pub fn changed_files_done(self: *Self, ctx: Ctx) Result {
+        var generation: usize = 0;
+        var exit_code: i64 = 0;
+        if (!try ctx.args.match(.{ tp.extract(&generation), tp.extract(&exit_code) })) return error.InvalidArgument;
+        if (generation != self.changes_generation) return;
+        try self.changed_files_flush();
+        const logger = log.logger("changes");
+        defer logger.deinit();
+        if (exit_code != 0)
+            logger.print("git diff failed with exit code {d}", .{exit_code})
+        else if (self.changes_count == 0)
+            logger.print("no changes", .{})
+        else
+            logger.print("{d} files changed", .{self.changes_count});
+    }
+    pub const changed_files_done_meta: Meta = .{ .arguments = &.{ .integer, .integer } };
+
+    /// Open the diff of one file from the changed-files list, against the same
+    /// base the list used.
+    pub fn diff_changed_file(self: *Self, ctx: Ctx) Result {
+        var path: []const u8 = undefined;
+        if (!try ctx.args.match(.{tp.extract(&path)})) return error.InvalidArgument;
+        const repo = self.changes_root.items;
+        if (repo.len == 0) return;
+        // The list shows project-relative paths; git wants them relative to
+        // the repository it runs in.
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const project = tp.env.get().str("project");
+        const abs = if (std.fs.path.isAbsolute(path)) path else std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ project, path }) catch return;
+        const rel = if (std.mem.startsWith(u8, abs, repo) and abs.len > repo.len + 1) abs[repo.len + 1 ..] else path;
+
+        const ref = self.changes_ref.items;
+        var name_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "*diff {s} {s}*", .{ if (ref.len > 0) ref else "HEAD", rel }) catch return;
+        if (ref.len > 0)
+            return stream_git_into_scratch(self, ctx, name, repo, &.{ "diff", "--merge-base", ref, "--", rel });
+        return stream_git_into_scratch(self, ctx, name, repo, &.{ "diff", "HEAD", "--", rel });
+    }
+    pub const diff_changed_file_meta: Meta = .{ .arguments = &.{.string} };
 
     /// Where diff_against_ref looks for its default ref, most preferred first.
     ///
