@@ -10,6 +10,7 @@ allocator: std.mem.Allocator,
 buffers: std.StringHashMapUnmanaged(*Buffer),
 file_store: ?FileStore = null,
 watched: std.AutoHashMapUnmanaged(*Buffer, []const u8) = .empty,
+next_open_seq: u64 = 0,
 
 pub fn init(allocator: std.mem.Allocator) Self {
     return .{
@@ -36,6 +37,12 @@ fn get_buffer(self: *const Self, file_path: []const u8) ?*Buffer {
 
 fn add_buffer(self: *Self, buffer: *Buffer) error{OutOfMemory}!void {
     try self.buffers.put(self.allocator, try self.allocator.dupe(u8, buffer.get_file_path()), buffer);
+    self.stamp_open_seq(buffer);
+}
+
+fn stamp_open_seq(self: *Self, buffer: *Buffer) void {
+    self.next_open_seq += 1;
+    buffer.open_seq = self.next_open_seq;
 }
 
 pub fn delete_buffer(self: *Self, buffer_: *Buffer) void {
@@ -51,6 +58,9 @@ pub fn open_file(self: *Self, io: std.Io, file_path: []const u8, now: std.Io.Tim
     const buffer = if (self.get_buffer(file_path)) |buffer| blk: {
         if (!buffer.ephemeral and buffer.hidden)
             try buffer.refresh_from_file(io, now);
+        // Reopening a closed buffer puts it at the end, like reopening a tab,
+        // instead of reclaiming a number the other buffers have moved into.
+        if (buffer.hidden) self.stamp_open_seq(buffer);
         break :blk buffer;
     } else blk: {
         var buffer = try Buffer.create(self.allocator, now);
@@ -86,7 +96,9 @@ pub fn mark_not_ephemeral(self: *Self, buffer: *Buffer) void {
 }
 
 pub fn write_state(self: *const Self, writer: *std.Io.Writer) error{ Stop, OutOfMemory, WriteFailed }!void {
-    const buffers = self.list_unordered(self.allocator) catch return;
+    // Written in open order: extract_state stamps buffers in the order it reads
+    // them, so this is what keeps buffer numbers the same across a restart.
+    const buffers = self.list_in_open_order(self.allocator) catch return;
     defer self.allocator.free(buffers);
     try cbor.writeArrayHeader(writer, buffers.len);
     for (buffers) |buffer| {
@@ -141,6 +153,17 @@ pub fn list_most_recently_used(self: *Self, allocator: std.mem.Allocator) error{
         }
     }.less_fn);
 
+    return result;
+}
+
+/// Every buffer, hidden ones included, in the order they were opened.
+pub fn list_in_open_order(self: *const Self, allocator: std.mem.Allocator) error{OutOfMemory}![]*Buffer {
+    const result = try self.list_unordered(allocator);
+    std.mem.sort(*Buffer, result, {}, struct {
+        fn less_fn(_: void, lhs: *Buffer, rhs: *Buffer) bool {
+            return lhs.open_seq < rhs.open_seq;
+        }
+    }.less_fn);
     return result;
 }
 

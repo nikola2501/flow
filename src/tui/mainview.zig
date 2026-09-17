@@ -2056,29 +2056,31 @@ const cmds = struct {
     }
     pub const diff_against_ref_next_candidate_meta: Meta = .{ .arguments = &.{.integer} };
 
-    /// Jump to the nth buffer, counting from 1.
+    /// Jump to the nth open buffer, counting from 1, in the order they were
+    /// opened -- the way a tab bar numbers tabs.
     ///
-    /// The order is the one switch_buffers shows, most recently used first, so
-    /// the numbers name rows in a list you can actually look at -- there is no
-    /// tab bar here to read them off. 1 is the buffer you are in and 2 is the
-    /// one you came from, which makes 2 a toggle between the last two files.
+    /// Visiting a buffer does not renumber anything, so 3 stays the same file
+    /// no matter which buffer you are in. Closed (hidden) buffers hold no number,
+    /// so closing one shifts the later ones down, again like closing a tab.
     pub fn goto_buffer(self: *Self, ctx: Ctx) Result {
         var n: usize = 0;
         if (!try ctx.args.match(.{tp.extract(&n)})) return error.InvalidArgument;
         if (n == 0) return;
 
-        const buffers = try self.buffer_manager.list_most_recently_used(self.allocator);
+        const buffers = try self.buffer_manager.list_in_open_order(self.allocator);
         defer self.allocator.free(buffers);
-        if (n > buffers.len) {
-            const logger = log.logger("buffer");
-            defer logger.deinit();
-            logger.print("no buffer {d}, {d} open", .{ n, buffers.len });
-            return;
+        var seen: usize = 0;
+        for (buffers) |buffer| {
+            if (buffer.hidden) continue;
+            seen += 1;
+            if (seen != n) continue;
+            const file_path = buffer.get_file_path();
+            if (file_path.len == 0) return;
+            return tp.self_pid().send(.{ "cmd", "navigate", .{ .file = file_path } });
         }
-
-        const file_path = buffers[n - 1].get_file_path();
-        if (file_path.len == 0) return;
-        try tp.self_pid().send(.{ "cmd", "navigate", .{ .file = file_path } });
+        const logger = log.logger("buffer");
+        defer logger.deinit();
+        logger.print("no buffer {d}, {d} open", .{ n, seen });
     }
     pub const goto_buffer_meta: Meta = .{
         .description = "Jump to a buffer by number",

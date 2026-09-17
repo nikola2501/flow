@@ -98,6 +98,10 @@ redo_head: ?*UndoNode = null,
 
 mtime: i64,
 utime: i64,
+/// Position in the order buffers were opened, assigned by the manager. Unlike
+/// utime it does not change when a buffer is merely visited, so it can number
+/// buffers the way a tab bar would.
+open_seq: u64 = 0,
 
 file_type_name: ?[]const u8 = null,
 file_type_icon: ?[]const u8 = null,
