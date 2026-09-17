@@ -18,6 +18,7 @@ const editor = @import("editor.zig");
 const FileList = @import("FileList.zig");
 const Panel = @import("Panel.zig");
 const PanelInput = @import("PanelInput.zig");
+const FilePreview = @import("FilePreview.zig");
 
 pub const name = @typeName(Self);
 
@@ -41,10 +42,15 @@ activate: ActivateMode = .normal,
 view_rows: usize = 0,
 view_cols: usize = 0,
 box: Widget.Box = .{},
+preview: FilePreview,
+/// Where the preview is drawn, beside the list; empty when the panel is too
+/// narrow to share.
+preview_box: Widget.Box = .{},
 
 const MenuType = Menu.Options(*Self).MenuType;
 const ButtonType = MenuType.ButtonType;
 const path_column_ratio = 4;
+const min_width_for_preview = 100;
 const widget_type: Widget.Type = .none;
 
 pub const panel_tag = "filelist";
@@ -77,6 +83,7 @@ pub fn create(allocator: Allocator, parent: Plane, manager: *FileList.Manager, l
         .menu = menu,
         .manager = manager,
         .list_id = list_id,
+        .preview = .init(allocator),
     };
     if (self.menu.scrollbar) |scrollbar| scrollbar.style_factory = scrollbar_style;
     self.menu.container.render_decoration = null;
@@ -89,6 +96,7 @@ pub fn deinit(self: *Self, allocator: Allocator) void {
     self.panel_input.deinit(Widget.to(self));
     if (self.current) self.commands.unregister();
     self.menu.widget().deinit(allocator);
+    self.preview.deinit();
     self.plane.deinit();
     allocator.destroy(self);
 }
@@ -159,10 +167,18 @@ pub fn handle_resize(self: *Self, pos: Widget.Box) void {
     self.plane.move_yx(@intCast(pos.y), @intCast(pos.x)) catch return;
     self.plane.resize_simple(@intCast(pos.h), @intCast(pos.w)) catch return;
     self.box = pos;
+    // Side by side rather than stacked: a bottom panel in a terminal is a few
+    // rows tall and a whole screen wide.
+    var list_box = pos;
+    self.preview_box = .{};
+    if (pos.w >= min_width_for_preview) {
+        list_box.w = pos.w * 45 / 100;
+        self.preview_box = .{ .y = 0, .x = list_box.w, .h = pos.h, .w = pos.w - list_box.w };
+    }
     self.menu.container.plane.layer = self.plane.layer;
     self.menu.container.plane.window.screen = self.plane.window.screen;
-    self.menu.container.resize(self.box);
-    const client_box = self.box.to_client_box(padding);
+    self.menu.container.resize(list_box);
+    const client_box = list_box.to_client_box(padding);
     self.view_rows = client_box.h;
     self.view_cols = client_box.w;
     self.update_scrollbar();
@@ -218,7 +234,20 @@ pub fn render(self: *Self, theme: *const Widget.Theme) bool {
     self.plane.set_base_style(theme.panel);
     self.plane.erase();
     self.plane.home();
-    return self.menu.container_widget.render(theme);
+    const more = self.menu.container_widget.render(theme);
+    self.render_preview(theme);
+    return more;
+}
+
+fn render_preview(self: *Self, theme: *const Widget.Theme) void {
+    if (self.preview_box.w == 0) return;
+    const fl = self.list() orelse return;
+    if (fl.entries.items.len == 0) return;
+    const sel = fl.selected orelse 0;
+    if (sel >= fl.entries.items.len) return;
+    const entry = &fl.entries.items[sel];
+    self.preview.load(entry.path);
+    self.preview.render(&self.plane, self.preview_box, theme, entry.begin_line);
 }
 
 fn handle_render_menu(self: *Self, button: *ButtonType, theme: *const Widget.Theme, selected: bool) bool {
