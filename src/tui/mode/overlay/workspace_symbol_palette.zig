@@ -114,6 +114,13 @@ fn receive(palette: *Type, _: tp.pid_ref, m: tp.message) MessageFilter.Error!boo
         try cbor.writeValue(writer, path);
         try cbor.writeValue(writer, line);
         try cbor.writeValue(writer, col);
+        // Grow to the widest row seen so names, paths and containers fit; the
+        // palette itself caps the width at the screen. Never shrink while the
+        // picker is open, so the overlay does not jump as results change.
+        var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const rel = project_manager.normalize_file_path(path, &rel_buf);
+        palette.longest = @max(palette.longest, tui.egc_chunk_width(symbol, 0, 1) + 3);
+        palette.longest_hint = @max(palette.longest_hint, rel.len + 8 + @max(container.len, 12));
         palette.append_async_item(value.written(), select) catch {};
         palette.value.count += 1;
         tui.need_render(@src());
