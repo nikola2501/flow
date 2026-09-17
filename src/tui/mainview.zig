@@ -78,6 +78,10 @@ hunks_generation: usize = 0,
 hunks_root: std.ArrayListUnmanaged(u8) = .empty,
 hunks_file: std.ArrayListUnmanaged(u8) = .empty,
 hunks_count: usize = 0,
+/// Output of the running open_vcs_blame_in_browser lookup, collected until git
+/// exits. Same generation scheme as the hunk list.
+blame_web_generation: usize = 0,
+blame_web_output: std.ArrayListUnmanaged(u8) = .empty,
 symbols: std.ArrayListUnmanaged(u8) = .empty,
 symbols_complete: bool = true,
 closing_project: bool = false,
@@ -174,6 +178,7 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     self.project_diagnostics_clear_all();
     self.hunks_root.deinit(allocator);
     self.hunks_file.deinit(allocator);
+    self.blame_web_output.deinit(allocator);
     self.store_last_match_text(null);
     allocator.destroy(self);
 }
@@ -1996,6 +2001,194 @@ const cmds = struct {
             logger.print("{d} hunks", .{self.hunks_count});
     }
     pub const vcs_hunks_done_meta: Meta = .{ .arguments = &.{ .integer, .integer } };
+
+    /// Open the line under the cursor in the origin remote's blame view.
+    ///
+    /// The line is traced to the commit that last changed it, and the page
+    /// opened is that commit's blame at the file's path and line *in that
+    /// commit* -- so it still lands on the right line after the file was
+    /// renamed or lines above it moved. GitHub and GitLab URL shapes.
+    ///
+    /// Lines changed locally have no commit yet and open nothing.
+    pub fn open_vcs_blame_in_browser(self: *Self, _: Ctx) Result {
+        const logger = log.logger("blame");
+        defer logger.deinit();
+        const editor = self.get_active_editor() orelse return;
+        const file_path = editor.file_path orelse return;
+        const row = editor.get_primary().cursor.row;
+        const head_row = editor.head_row_for(row) orelse {
+            logger.print("line {d} is a local change, not on the remote yet", .{row + 1});
+            return;
+        };
+
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const project = tp.env.get().str("project");
+        const abs = if (std.fs.path.isAbsolute(file_path))
+            file_path
+        else
+            std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ project, file_path }) catch return;
+        const dir = std.fs.path.dirname(abs) orelse return;
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const repo = cmds.repo_root(dir, &root_buf) orelse {
+            logger.print("not inside a git repository", .{});
+            return;
+        };
+        if (abs.len <= repo.len + 1) return;
+        const rel = abs[repo.len + 1 ..];
+
+        var line_buf: [32]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "{d}", .{head_row + 1}) catch return;
+
+        // One round trip: the remote and the blame together, as key/value
+        // lines. Paths travel as positional arguments, never spliced into the
+        // script, so no quoting can break.
+        const script =
+            \\set -e
+            \\url=$(git -C "$1" remote get-url origin)
+            \\blame=$(git -C "$1" blame --porcelain -L "$3,$3" HEAD -- "$2")
+            \\printf 'url %s\n' "$url"
+            \\printf '%s\n' "$blame" | head -n 1 | { read -r sha orig rest; printf 'sha %s\nline %s\n' "$sha" "$orig"; }
+            \\printf '%s\n' "$blame" | sed -n 's/^filename /file /p' | head -n 1
+        ;
+
+        self.blame_web_generation += 1;
+        self.blame_web_output.clearRetainingCapacity();
+
+        var argv: std.Io.Writer.Allocating = .init(self.allocator);
+        defer argv.deinit();
+        const writer = &argv.writer;
+        try cbor.writeArrayHeader(writer, 7);
+        try cbor.writeValue(writer, "sh");
+        try cbor.writeValue(writer, "-c");
+        try cbor.writeValue(writer, script);
+        try cbor.writeValue(writer, "sh");
+        try cbor.writeValue(writer, repo);
+        try cbor.writeValue(writer, rel);
+        try cbor.writeValue(writer, line);
+
+        const handlers = struct {
+            fn out(context: usize, parent: tp.pid_ref, _: []const u8, output: []const u8) void {
+                parent.send(.{ "cmd", "vcs_blame_web_output", .{ context, output } }) catch {};
+            }
+            fn err(_: usize, _: tp.pid_ref, _: []const u8, output: []const u8) void {
+                const l = log.logger("blame");
+                defer l.deinit();
+                l.print("{s}", .{std.mem.trimEnd(u8, output, "\n")});
+            }
+            fn exit(context: usize, parent: tp.pid_ref, _: []const u8, _: []const u8, exit_code: i64) void {
+                parent.send(.{ "cmd", "vcs_blame_web_done", .{ context, exit_code } }) catch {};
+            }
+        };
+        try shell.execute(self.allocator, .{ .buf = argv.written() }, .{
+            .context = self.blame_web_generation,
+            .out = handlers.out,
+            .err = handlers.err,
+            .exit = handlers.exit,
+        });
+    }
+    pub const open_vcs_blame_in_browser_meta: Meta = .{ .description = "Open blame for the current line in the browser" };
+
+    pub fn vcs_blame_web_output(self: *Self, ctx: Ctx) Result {
+        var generation: usize = 0;
+        var output: []const u8 = undefined;
+        if (!try ctx.args.match(.{ tp.extract(&generation), tp.extract(&output) })) return error.InvalidArgument;
+        if (generation != self.blame_web_generation) return;
+        try self.blame_web_output.appendSlice(self.allocator, output);
+    }
+    pub const vcs_blame_web_output_meta: Meta = .{ .arguments = &.{ .integer, .string } };
+
+    pub fn vcs_blame_web_done(self: *Self, ctx: Ctx) Result {
+        var generation: usize = 0;
+        var exit_code: i64 = 0;
+        if (!try ctx.args.match(.{ tp.extract(&generation), tp.extract(&exit_code) })) return error.InvalidArgument;
+        if (generation != self.blame_web_generation) return;
+        const logger = log.logger("blame");
+        defer logger.deinit();
+        if (exit_code != 0) {
+            logger.print("no origin remote, or git blame failed (exit {d})", .{exit_code});
+            return;
+        }
+
+        var remote: []const u8 = "";
+        var sha: []const u8 = "";
+        var line: []const u8 = "";
+        var file: []const u8 = "";
+        var lines = std.mem.splitScalar(u8, self.blame_web_output.items, '\n');
+        while (lines.next()) |l| {
+            if (std.mem.startsWith(u8, l, "url ")) remote = l[4..];
+            if (std.mem.startsWith(u8, l, "sha ")) sha = l[4..];
+            if (std.mem.startsWith(u8, l, "line ")) line = l[5..];
+            if (std.mem.startsWith(u8, l, "file ")) file = l[5..];
+        }
+        if (remote.len == 0 or sha.len == 0 or line.len == 0 or file.len == 0) {
+            logger.print("could not read the blame for this line", .{});
+            return;
+        }
+        // git blame names a line that is only in the working tree with the
+        // all-zero id; there is no remote page for it.
+        if (std.mem.trim(u8, sha, "0").len == 0) {
+            logger.print("this line is not committed yet", .{});
+            return;
+        }
+
+        var url_buf: [4096]u8 = undefined;
+        const url = blame_web_url(&url_buf, remote, sha, file, line) orelse {
+            logger.print("unsupported remote: {s}", .{remote});
+            return;
+        };
+
+        const opener = if (builtin.os.tag == .macos) "open" else "xdg-open";
+        var argv: std.Io.Writer.Allocating = .init(self.allocator);
+        defer argv.deinit();
+        try cbor.writeArrayHeader(&argv.writer, 2);
+        try cbor.writeValue(&argv.writer, opener);
+        try cbor.writeValue(&argv.writer, url);
+        const quiet = struct {
+            fn out(_: usize, _: tp.pid_ref, _: []const u8, _: []const u8) void {}
+        };
+        try shell.execute(self.allocator, .{ .buf = argv.written() }, .{ .out = quiet.out });
+        logger.print("{s}", .{url});
+    }
+    pub const vcs_blame_web_done_meta: Meta = .{ .arguments = &.{ .integer, .integer } };
+
+    /// https base for a git remote: git@host:owner/repo(.git),
+    /// ssh://git@host[:port]/owner/repo(.git), or http(s)://host/owner/repo(.git).
+    fn remote_web_base(buf: []u8, remote_: []const u8) ?[]const u8 {
+        var remote = std.mem.trim(u8, remote_, " \t\r");
+        if (std.mem.endsWith(u8, remote, ".git")) remote = remote[0 .. remote.len - 4];
+        if (std.mem.startsWith(u8, remote, "git@")) {
+            const rest = remote[4..];
+            const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+            return std.fmt.bufPrint(buf, "https://{s}/{s}", .{ rest[0..colon], rest[colon + 1 ..] }) catch null;
+        }
+        if (std.mem.startsWith(u8, remote, "ssh://")) {
+            var rest = remote[6..];
+            if (std.mem.indexOfScalar(u8, rest, '@')) |at| rest = rest[at + 1 ..];
+            const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+            var host = rest[0..slash];
+            // An ssh port means nothing to the web server.
+            if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
+            return std.fmt.bufPrint(buf, "https://{s}{s}", .{ host, rest[slash..] }) catch null;
+        }
+        if (std.mem.startsWith(u8, remote, "https://") or std.mem.startsWith(u8, remote, "http://"))
+            return std.fmt.bufPrint(buf, "{s}", .{remote}) catch null;
+        return null;
+    }
+
+    fn blame_web_url(buf: []u8, remote: []const u8, sha: []const u8, file: []const u8, line: []const u8) ?[]const u8 {
+        var base_buf: [1024]u8 = undefined;
+        const base = remote_web_base(&base_buf, remote) orelse return null;
+        const segment = if (std.mem.indexOf(u8, base, "gitlab") != null) "/-/blame/" else "/blame/";
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("{s}{s}{s}/", .{ base, segment, sha }) catch return null;
+        const hex = "0123456789ABCDEF";
+        for (file) |c| switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.', '~', '/' => w.writeByte(c) catch return null,
+            else => w.print("%{c}{c}", .{ hex[c >> 4], hex[c & 15] }) catch return null,
+        };
+        w.print("#L{s}", .{line}) catch return null;
+        return w.buffered();
+    }
 
     const HunkHeader = struct { new_start: usize, added: usize, removed: usize, context: []const u8 };
 

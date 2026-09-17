@@ -1554,6 +1554,13 @@ pub const Editor = struct {
         return if (head_line < 0) null else @intCast(head_line);
     }
 
+    /// The row in the HEAD version of the file that `row` corresponds to, or
+    /// null when `row` is a line added or modified locally and so has no HEAD
+    /// counterpart.
+    pub fn head_row_for(self: *const Self, row: usize) ?usize {
+        return self.get_delta_lines_until_row(row);
+    }
+
     pub fn get_vcs_blame(self: *const Self, row: usize) ?*const Buffer.VcsBlame.Commit {
         const buffer = self.buffer orelse return null;
         const blame_row = self.get_delta_lines_until_row(row) orelse return null;

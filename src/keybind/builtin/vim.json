@@ -21,6 +21,7 @@
 
             ["<Space>gs", "show_vcs_status"],
             ["<Space>gh", "show_vcs_hunks"],
+            ["<Space>gb", "open_vcs_blame_in_browser"],
 
             ["<Space>sd", "show_diagnostics"],
             ["<Space>sD", "show_project_diagnostics"],
