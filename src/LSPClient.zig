@@ -1121,6 +1121,206 @@ fn send_reference(tag: []const u8, stream: usize, to: tp.pid_ref, location_: []c
     };
 }
 
+// ---- call hierarchy ------------------------------------------------------
+//
+// Results go to `from` (the tui) as "CH" messages keyed by a node id the tui
+// chose, so a late answer for a node the user has since left is recognisable:
+//
+//   "CH" "root"  id name detail path line col item
+//   "CH" "child" id name detail path line jump_path jump_line jump_col calls item
+//   "CH" "done"  id
+//   "CH" "error" id message
+//
+// Lines and columns are zero-based. `item` is the server's CallHierarchyItem as
+// raw CBOR, handed back untouched when that node is expanded -- the protocol
+// requires the exact item, including any opaque `data` field.
+
+const CallItem = struct {
+    name: []const u8 = "",
+    detail: []const u8 = "",
+    uri: []const u8 = "",
+    line: usize = 0,
+    col: usize = 0,
+};
+
+fn read_call_item(raw: []const u8) (error{InvalidCallHierarchyItem} || RangeError || cbor.Error)!CallItem {
+    var item: CallItem = .{};
+    var iter = raw;
+    var len = try cbor.decodeMapHeader(&iter);
+    while (len > 0) : (len -= 1) {
+        var field: []const u8 = undefined;
+        if (!try cbor.matchString(&iter, &field)) return error.InvalidCallHierarchyItem;
+        if (std.mem.eql(u8, field, "name")) {
+            if (!try cbor.matchValue(&iter, cbor.extract(&item.name))) return error.InvalidCallHierarchyItem;
+        } else if (std.mem.eql(u8, field, "detail")) {
+            if (!try cbor.matchValue(&iter, cbor.extract(&item.detail))) try cbor.skipValue(&iter);
+        } else if (std.mem.eql(u8, field, "uri")) {
+            if (!try cbor.matchValue(&iter, cbor.extract(&item.uri))) return error.InvalidCallHierarchyItem;
+        } else if (std.mem.eql(u8, field, "selectionRange")) {
+            var range_raw: []const u8 = undefined;
+            if (!try cbor.matchValue(&iter, cbor.extract_cbor(&range_raw))) return error.InvalidCallHierarchyItem;
+            const range = try read_range(range_raw);
+            item.line = range.start.line;
+            item.col = range.start.character;
+        } else {
+            try cbor.skipValue(&iter);
+        }
+    }
+    if (item.uri.len == 0) return error.InvalidCallHierarchyItem;
+    return item;
+}
+
+fn send_call_error(from: tp.pid_ref, node_id: usize, response: tp.message) void {
+    var err_raw: []const u8 = undefined;
+    var message: []const u8 = "";
+    var code: i64 = 0;
+    if (cbor.match(response.buf, .{ "child", tp.string, "error", tp.extract_cbor(&err_raw) }) catch false) {
+        var iter = err_raw;
+        var len = cbor.decodeMapHeader(&iter) catch 0;
+        while (len > 0) : (len -= 1) {
+            var field: []const u8 = undefined;
+            if (!(cbor.matchString(&iter, &field) catch false)) break;
+            if (std.mem.eql(u8, field, "message")) {
+                if (!(cbor.matchValue(&iter, cbor.extract(&message)) catch false)) cbor.skipValue(&iter) catch break;
+            } else if (std.mem.eql(u8, field, "code")) {
+                if (!(cbor.matchValue(&iter, cbor.extract(&code)) catch false)) cbor.skipValue(&iter) catch break;
+            } else cbor.skipValue(&iter) catch break;
+        }
+    }
+    // -32601 is JSON-RPC's "method not found", which servers often send with an
+    // empty message: say what it means instead of logging nothing.
+    if (code == -32601)
+        message = "this language server does not support call hierarchy"
+    else if (message.len == 0)
+        message = "the language server returned an error";
+    from.send(.{ "CH", "error", node_id, message }) catch {};
+}
+
+pub fn call_hierarchy_prepare(self: *Self, from: tp.pid_ref, source_location: *const SourceLocation) SendGotoRequestError!void {
+    const uri = try make_URI(self.allocator, self.project_name, source_location.src.path);
+    defer self.allocator.free(uri);
+
+    const handler: struct {
+        from: tp.pid,
+
+        pub fn deinit(self_: *@This()) void {
+            self_.from.deinit();
+        }
+
+        pub fn receive(self_: @This(), response: tp.message) !void {
+            const to = self_.from.ref();
+            var items: []const u8 = undefined;
+            if (!try cbor.match(response.buf, .{ "child", tp.string, "result", tp.extract_cbor(&items) }))
+                return send_call_error(to, 0, response);
+            var iter = items;
+            const count = cbor.decodeArrayHeader(&iter) catch 0;
+            var raw: []const u8 = undefined;
+            if (count == 0 or !try cbor.matchValue(&iter, cbor.extract_cbor(&raw))) {
+                to.send(.{ "CH", "error", @as(usize, 0), "no function at the cursor" }) catch {};
+                return;
+            }
+            const item = try read_call_item(raw);
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path = try file_uri_to_path(item.uri, &path_buf);
+            try to.send(.{ "CH", "root", @as(usize, 0), item.name, item.detail, path, item.line, item.col, raw });
+        }
+    } = .{ .from = from.clone() };
+
+    self.lsp.send_request(self.allocator, "textDocument/prepareCallHierarchy", .{
+        .textDocument = .{ .uri = uri },
+        .position = .{ .line = source_location.src.line, .character = source_location.src.column },
+    }, handler) catch return error.LspFailed;
+}
+
+pub const CallDirection = enum { incoming, outgoing };
+
+pub fn call_hierarchy_calls(self: *Self, from: tp.pid_ref, direction: CallDirection, node_id: usize, item: []const u8) (LspError || cbor.Error)!void {
+    // For outgoing calls the call sites (fromRanges) lie in the *caller*, which
+    // is the item being expanded, so its uri is where the jumps go.
+    const parent = read_call_item(item) catch return error.LspFailed;
+    var parent_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_path = file_uri_to_path(parent.uri, &parent_path_buf) catch return error.LspFailed;
+
+    const handler: struct {
+        from: tp.pid,
+        direction: CallDirection,
+        node_id: usize,
+        parent_path: []const u8,
+
+        pub fn deinit(self_: *@This()) void {
+            std.heap.c_allocator.free(self_.parent_path);
+            self_.from.deinit();
+        }
+
+        pub fn receive(self_: @This(), response: tp.message) !void {
+            const to = self_.from.ref();
+            defer to.send(.{ "CH", "done", self_.node_id }) catch {};
+            var calls: []const u8 = undefined;
+            if (try cbor.match(response.buf, .{ "child", tp.string, "result", tp.null_ })) return;
+            if (!try cbor.match(response.buf, .{ "child", tp.string, "result", tp.extract_cbor(&calls) }))
+                return send_call_error(to, self_.node_id, response);
+
+            const item_field = if (self_.direction == .incoming) "from" else "to";
+            var iter = calls;
+            var len = try cbor.decodeArrayHeader(&iter);
+            while (len > 0) : (len -= 1) {
+                var call_raw: []const u8 = undefined;
+                if (!try cbor.matchValue(&iter, cbor.extract_cbor(&call_raw))) return;
+                var item_raw: []const u8 = &.{};
+                var ranges_raw: []const u8 = &.{};
+                var fields = call_raw;
+                var n = try cbor.decodeMapHeader(&fields);
+                while (n > 0) : (n -= 1) {
+                    var field: []const u8 = undefined;
+                    if (!try cbor.matchString(&fields, &field)) return;
+                    if (std.mem.eql(u8, field, item_field)) {
+                        _ = try cbor.matchValue(&fields, cbor.extract_cbor(&item_raw));
+                    } else if (std.mem.eql(u8, field, "fromRanges")) {
+                        _ = try cbor.matchValue(&fields, cbor.extract_cbor(&ranges_raw));
+                    } else try cbor.skipValue(&fields);
+                }
+                if (item_raw.len == 0) continue;
+                const call_item = read_call_item(item_raw) catch continue;
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const path = file_uri_to_path(call_item.uri, &path_buf) catch continue;
+
+                // The first call site, and how many there are. Incoming sites
+                // are in the caller's file; outgoing ones in the parent's.
+                var jump_line = call_item.line;
+                var jump_col = call_item.col;
+                var site_count: usize = 0;
+                if (ranges_raw.len > 0) {
+                    var ranges = ranges_raw;
+                    site_count = cbor.decodeArrayHeader(&ranges) catch 0;
+                    var first: []const u8 = undefined;
+                    if (site_count > 0 and (cbor.matchValue(&ranges, cbor.extract_cbor(&first)) catch false)) {
+                        if (read_range(first)) |range| {
+                            jump_line = range.start.line;
+                            jump_col = range.start.character;
+                        } else |_| {}
+                    }
+                }
+                const jump_path = if (self_.direction == .incoming) path else self_.parent_path;
+                try to.send(.{ "CH", "child", self_.node_id, call_item.name, call_item.detail, path, call_item.line, jump_path, jump_line, jump_col, site_count, item_raw });
+            }
+        }
+    } = .{
+        .from = from.clone(),
+        .direction = direction,
+        .node_id = node_id,
+        .parent_path = try std.heap.c_allocator.dupe(u8, parent_path),
+    };
+
+    var params: std.Io.Writer.Allocating = .init(self.allocator);
+    defer params.deinit();
+    try cbor.writeMapHeader(&params.writer, 1);
+    try cbor.writeValue(&params.writer, "item");
+    try params.writer.writeAll(item);
+
+    const method = if (direction == .incoming) "callHierarchy/incomingCalls" else "callHierarchy/outgoingCalls";
+    self.lsp.send_request_raw(self.allocator, method, params.written(), handler) catch return error.LspFailed;
+}
+
 pub fn highlight_references(self: *Self, from: tp.pid_ref, source_location: *const SourceLocation) SendGotoRequestError!void {
     const uri = try make_URI(self.allocator, self.project_name, source_location.src.path);
     defer self.allocator.free(uri);

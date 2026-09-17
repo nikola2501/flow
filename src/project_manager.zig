@@ -310,6 +310,24 @@ pub fn references(source_location: SourceLocation) (ProjectManagerError || Proje
     return send(.{ "references", project, source_location });
 }
 
+pub fn call_hierarchy_prepare(source_location: SourceLocation) (ProjectManagerError || ProjectError)!void {
+    const project = tp.env.get().str("project");
+    if (project.len == 0)
+        return error.NoProject;
+    return send(.{ "call_hierarchy_prepare", project, source_location });
+}
+
+pub const CallDirection = Project.CallDirection;
+
+/// `item` is the raw CBOR CallHierarchyItem from an earlier result; it travels
+/// as a byte string and is handed to the server unchanged.
+pub fn call_hierarchy_calls(file_path: []const u8, direction: CallDirection, node_id: usize, item: []const u8) (ProjectManagerError || ProjectError)!void {
+    const project = tp.env.get().str("project");
+    if (project.len == 0)
+        return error.NoProject;
+    return send(.{ "call_hierarchy_calls", project, file_path, @tagName(direction), node_id, item });
+}
+
 pub fn highlight_references(source_location: SourceLocation) (ProjectManagerError || ProjectError)!void {
     const project = tp.env.get().str("project");
     if (project.len == 0)
@@ -598,6 +616,16 @@ const Process = struct {
             self.goto_type_definition(from, project_directory, &source_location) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
         } else if (try cbor.match(m.buf, .{ "references", tp.extract(&project_directory), tp.extract(&source_location) })) {
             self.references(from, project_directory, &source_location) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
+        } else if (try cbor.match(m.buf, .{ "call_hierarchy_prepare", tp.extract(&project_directory), tp.extract(&source_location) })) {
+            self.call_hierarchy_prepare(from, project_directory, &source_location) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
+        } else if (try cbor.match(m.buf, .{ "call_hierarchy_calls", tp.extract(&project_directory), tp.extract(&path), tp.more })) {
+            var direction_name: []const u8 = undefined;
+            var node_id: usize = 0;
+            var item: []const u8 = undefined;
+            if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.extract(&direction_name), tp.extract(&node_id), tp.extract(&item) })) {
+                const direction = std.meta.stringToEnum(CallDirection, direction_name) orelse return;
+                self.call_hierarchy_calls(from, project_directory, path, direction, node_id, item) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
+            }
         } else if (try cbor.match(m.buf, .{ "highlight_references", tp.extract(&project_directory), tp.extract(&source_location) })) {
             self.highlight_references(from, project_directory, &source_location) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
         } else if (try cbor.match(m.buf, .{ "symbols", tp.extract(&project_directory), tp.extract(&path) })) {
@@ -1032,6 +1060,16 @@ const Process = struct {
         defer frame.deinit();
         const project = self.projects.get(project_directory) orelse return error.NoProject;
         return project.references(from, args);
+    }
+
+    fn call_hierarchy_prepare(self: *Process, from: tp.pid_ref, project_directory: []const u8, args: *const SourceLocation) (ProjectError || Project.SendGotoRequestError)!void {
+        const project = self.projects.get(project_directory) orelse return error.NoProject;
+        return project.call_hierarchy_prepare(from, args);
+    }
+
+    fn call_hierarchy_calls(self: *Process, from: tp.pid_ref, project_directory: []const u8, file_path: []const u8, direction: CallDirection, node_id: usize, item: []const u8) (ProjectError || Project.SendGotoRequestError)!void {
+        const project = self.projects.get(project_directory) orelse return error.NoProject;
+        return project.call_hierarchy_calls(from, file_path, direction, node_id, item);
     }
 
     fn highlight_references(self: *Process, from: tp.pid_ref, project_directory: []const u8, args: *const SourceLocation) (ProjectError || Project.SendGotoRequestError)!void {

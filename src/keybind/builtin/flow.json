@@ -235,6 +235,8 @@
             ["shift+f3", "goto_prev_match"],
             ["shift+f10", "toggle_syntax_highlighting"],
             ["shift+f12", "references"],
+            ["ctrl+shift+f12", "show_incoming_calls"],
+            ["ctrl+alt+f12", "show_outgoing_calls"],
             ["shift+left", "select_left"],
             ["shift+right", "select_right"],
             ["shift+up", "select_up"],

@@ -60,6 +60,19 @@ pub fn send_request(
     return RequestContext(@TypeOf(ctx)).send(allocator, self.pid.ref(), ctx, tp.message.fmt(.{ "REQ", method, cb.written() }));
 }
 
+/// send_request with params that are already CBOR -- for echoing back a value
+/// the server gave us (a CallHierarchyItem) byte for byte, fields we do not
+/// model included.
+pub fn send_request_raw(
+    self: *const Self,
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    params_cbor: []const u8,
+    ctx: anytype,
+) (OutOfMemoryError || SpawnError)!void {
+    return RequestContext(@TypeOf(ctx)).send(allocator, self.pid.ref(), ctx, tp.message.fmt(.{ "REQ", method, params_cbor }));
+}
+
 pub fn send_notification(self: *const Self, method: []const u8, m: anytype) (OutOfMemoryError || SendError || std.Io.Writer.Error)!void {
     var cb: std.Io.Writer.Allocating = .init(self.allocator);
     defer cb.deinit();

@@ -607,11 +607,13 @@ pub fn Create(options: type) type {
             pub const palette_menu_up_meta: Meta = .{};
 
             pub fn palette_menu_right(self: *Self, ctx: Ctx) Result {
+                if (@hasDecl(options, "menu_right")) return options.menu_right(self);
                 return palette_menu_down(self, ctx);
             }
             pub const palette_menu_right_meta: Meta = .{};
 
             pub fn palette_menu_left(self: *Self, ctx: Ctx) Result {
+                if (@hasDecl(options, "menu_left")) return options.menu_left(self);
                 return palette_menu_up(self, ctx);
             }
             pub const palette_menu_left_meta: Meta = .{};

@@ -1777,6 +1777,16 @@ const cmds = struct {
     }
     pub const open_command_palette_meta: Meta = .{ .description = "Command palette" };
 
+    pub fn show_incoming_calls(self: *Self, ctx: Ctx) Result {
+        return self.enter_overlay_mode_with_args(@import("mode/overlay/call_hierarchy_palette.zig").Type, .{ .io = ctx.io, .now = ctx.now, .args = tp.message.fmt(.{"incoming"}) });
+    }
+    pub const show_incoming_calls_meta: Meta = .{ .description = "Language: Show incoming calls (who calls this)" };
+
+    pub fn show_outgoing_calls(self: *Self, ctx: Ctx) Result {
+        return self.enter_overlay_mode_with_args(@import("mode/overlay/call_hierarchy_palette.zig").Type, .{ .io = ctx.io, .now = ctx.now, .args = tp.message.fmt(.{"outgoing"}) });
+    }
+    pub const show_outgoing_calls_meta: Meta = .{ .description = "Language: Show outgoing calls (what this calls)" };
+
     pub fn open_file_tree(self: *Self, ctx: Ctx) Result {
         return self.enter_overlay_mode(@import("mode/overlay/file_tree_palette.zig").Type, ctx);
     }

@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 const project_manager = @import("project_manager.zig");
 const LSP = @import("LSP.zig");
 const LSPClient = @import("LSPClient.zig");
+pub const CallDirection = LSPClient.CallDirection;
 const walk_tree = @import("walk_tree.zig");
 const file_watcher = @import("file_watcher");
 const gitignore = @import("gitignore");
@@ -1253,6 +1254,17 @@ pub fn goto_type_definition(self: *Self, from: tp.pid_ref, args: *const SourceLo
 pub fn references(self: *Self, from: tp.pid_ref, source_location: *const SourceLocation) SendGotoRequestError!void {
     const client = try self.get_lsp_client_for_file(source_location.src.path);
     return client.references(from, source_location);
+}
+
+pub fn call_hierarchy_prepare(self: *Self, from: tp.pid_ref, source_location: *const SourceLocation) SendGotoRequestError!void {
+    const client = try self.get_lsp_client_for_file(source_location.src.path);
+    return client.call_hierarchy_prepare(from, source_location);
+}
+
+/// `file_path` only picks the language server: the one that produced `item`.
+pub fn call_hierarchy_calls(self: *Self, from: tp.pid_ref, file_path: []const u8, direction: CallDirection, node_id: usize, item: []const u8) SendGotoRequestError!void {
+    const client = try self.get_lsp_client_for_file(file_path);
+    return client.call_hierarchy_calls(from, direction, node_id, item);
 }
 
 pub fn highlight_references(self: *Self, from: tp.pid_ref, source_location: *const SourceLocation) SendGotoRequestError!void {

@@ -16,6 +16,8 @@
 
             ["<Space>cd", "show_diagnostics"],
             ["<Space>cf", "format"],
+            ["<Space>ci", "show_incoming_calls"],
+            ["<Space>co", "show_outgoing_calls"],
             ["<Space>cr", "rename_symbol"],
             ["<Space>cs", "show_symbols"],
 
