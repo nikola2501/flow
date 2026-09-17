@@ -163,7 +163,8 @@ centres the target line and highlights it, and follows the selection.
 
 | Area | Files |
 |---|---|
-| Diff, changed files, hunks, blame, project diagnostics, buffer numbers | `src/tui/mainview.zig` (commands in `cmds`, state fields on the view) |
+| Diff, changed files, hunks, blame, project diagnostics, buffer numbers | `src/tui/mainview_fork.zig` (its own command collection and a `State` struct) |
+| Hooks into the main view | `src/tui/mainview.zig`: the `fork` field, `fork_commands` init and deinit, two diagnostics calls, five helpers made `pub` |
 | Call hierarchy requests | `src/LSP.zig` (`send_request_raw`), `src/LSPClient.zig`, `src/Project.zig`, `src/project_manager.zig` |
 | Call hierarchy tree | `src/tui/mode/overlay/call_hierarchy_palette.zig`, left/right hooks in `palette.zig` |
 | Source preview | `src/tui/FilePreview.zig`, layout in `src/tui/filelist_view.zig` |
@@ -193,9 +194,11 @@ Merge rather than rebase. A merge resolves conflicts once for the whole range.
 A rebase replays each fork commit and can raise the same conflict in several of
 them.
 
-The fork is about 2,000 added lines in 16 files, with 8 upstream lines changed.
-Two files are entirely new, and most of the rest is new code added at the end of
-existing blocks. Conflicts therefore tend to be small: a field or import added
+The fork is about 2,000 added lines, and three of its files are entirely new.
+Most of it is in `mainview_fork.zig`. The upstream `mainview.zig` changes by only
+15 lines. That matters because `mainview.zig` is one of the files upstream edits
+most. The rest of the fork's changes are new code added at the end of existing
+blocks. Conflicts therefore tend to be small: a field or import added
 next to a line upstream also touched. The resolution is usually to keep both
 sides.
 
