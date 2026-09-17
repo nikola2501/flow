@@ -22,6 +22,7 @@
             ["<Space>gs", "show_vcs_status"],
 
             ["<Space>sd", "show_diagnostics"],
+            ["<Space>sD", "show_project_diagnostics"],
             ["<Space>ss", "show_symbols"],
 
             ["<Space>wd", "close_split"],

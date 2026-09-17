@@ -67,6 +67,11 @@ buffer_manager: Buffer.Manager,
 filelist_streams: std.AutoArrayHashMapUnmanaged(FileList.Stream, StreamInfo) = .empty,
 next_filelist_stream: FileList.Stream = FileList.stream_first_dynamic,
 filelists: FileList.Manager = undefined,
+/// Every diagnostic the language servers have published, by file, whether the
+/// file is open or not. The per-editor lists only exist for open files, and the
+/// diagnostics panel is rebuilt from whichever file was published last, so
+/// neither can answer "what is wrong across the project".
+project_diagnostics: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(StoredDiagnostic)) = .empty,
 symbols: std.ArrayListUnmanaged(u8) = .empty,
 symbols_complete: bool = true,
 closing_project: bool = false,
@@ -160,8 +165,79 @@ pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     self.buffer_manager.deinit();
     self.lsp_info.deinit();
     self.filelists.deinit();
+    self.project_diagnostics_clear_all();
     self.store_last_match_text(null);
     allocator.destroy(self);
+}
+
+const StoredDiagnostic = struct {
+    begin_row: usize,
+    begin_col: usize,
+    end_row: usize,
+    end_col: usize,
+    severity: i32,
+    message: []const u8, // owned
+};
+
+fn project_diagnostics_clear_all(self: *Self) void {
+    var it = self.project_diagnostics.iterator();
+    while (it.next()) |kv| {
+        for (kv.value_ptr.items) |d| self.allocator.free(d.message);
+        kv.value_ptr.deinit(self.allocator);
+        self.allocator.free(kv.key_ptr.*);
+    }
+    self.project_diagnostics.deinit(self.allocator);
+    self.project_diagnostics = .empty;
+}
+
+fn project_diagnostics_store(self: *Self, file_path: []const u8, severity: i32, message: []const u8, sel: ed.Selection) !void {
+    const gop = try self.project_diagnostics.getOrPut(self.allocator, file_path);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try self.allocator.dupe(u8, file_path);
+        gop.value_ptr.* = .empty;
+    }
+    try gop.value_ptr.append(self.allocator, .{
+        .begin_row = sel.begin.row,
+        .begin_col = sel.begin.col,
+        .end_row = sel.end.row,
+        .end_col = sel.end.col,
+        .severity = severity,
+        .message = try self.allocator.dupe(u8, message),
+    });
+}
+
+fn project_diagnostics_forget(self: *Self, file_path: []const u8) void {
+    const kv = self.project_diagnostics.fetchSwapRemove(file_path) orelse return;
+    for (kv.value.items) |d| self.allocator.free(d.message);
+    var list = kv.value;
+    list.deinit(self.allocator);
+    self.allocator.free(kv.key);
+}
+
+fn project_diagnostics_add_entry(self: *Self, list_id: FileList.Id, file_path: []const u8, d: StoredDiagnostic, stream_type: anytype) !void {
+    // add_filelist_entry takes one-based positions on both axes.
+    try self.add_filelist_entry(
+        list_id,
+        file_path,
+        d.begin_row + 1,
+        d.begin_col + 1,
+        d.end_row + 1,
+        d.end_col + 1,
+        d.message,
+        ed.Diagnostic.to_severity(d.severity),
+        stream_type,
+    );
+}
+
+/// Rebuild the project list from the store, but only while its panel exists:
+/// a server republishing a file must not pop the panel open by itself.
+fn project_diagnostics_refresh(self: *Self) !void {
+    const list = self.filelists.find_by_kind(.project_diagnostics) orelse return;
+    if (self.filelist_view_for(list.list_id) == null) return;
+    self.clear_find_in_files_results(list.list_id);
+    var it = self.project_diagnostics.iterator();
+    while (it.next()) |kv| for (kv.value_ptr.items) |d|
+        try self.project_diagnostics_add_entry(list.list_id, kv.key_ptr.*, d, .background);
 }
 
 // Receives the file_path to identify symbols to clear
@@ -1512,6 +1588,9 @@ const cmds = struct {
         })) return error.InvalidAddDiagnosticArgument;
         var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         file_path = project_manager.normalize_file_path(file_path, &file_path_buf);
+        try self.project_diagnostics_store(file_path, severity, message, sel);
+        if (self.filelists.find_by_kind(.project_diagnostics)) |list| if (self.filelist_view_for(list.list_id) != null)
+            try self.project_diagnostics_add_entry(list.list_id, file_path, self.project_diagnostics.get(file_path).?.getLast(), .background);
         if (self.get_editor_for_file(file_path)) |editor| {
             try editor.add_diagnostic(file_path, source, code, message, severity, sel);
             if (!tui.config().show_local_diagnostics_in_panel)
@@ -1727,6 +1806,12 @@ const cmds = struct {
         if (self.get_editor_for_file(file_path)) |editor|
             editor.clear_diagnostics();
 
+        // A publish is a clear followed by the file's new diagnostics, so the
+        // project list drops only this file and the adds that follow refill it.
+        const had_any = self.project_diagnostics.contains(file_path);
+        self.project_diagnostics_forget(file_path);
+        if (had_any) try self.project_diagnostics_refresh();
+
         if (self.filelists.find_by_kind(.diagnostics)) |list| {
             self.clear_find_in_files_results(list.list_id);
             self.close_filelist_panel(list.list_id);
@@ -1753,6 +1838,26 @@ const cmds = struct {
         }
     }
     pub const show_diagnostics_meta: Meta = .{ .description = "Show diagnostics panel" };
+
+    /// Every diagnostic the language servers have reported, across all files,
+    /// open or not. Stays live: it follows each new publish while it is open.
+    ///
+    /// Only as complete as the servers make it -- many analyse just the files
+    /// they have been told about, so a file nobody opened may not appear.
+    pub fn show_project_diagnostics(self: *Self, _: Ctx) Result {
+        const list = try self.filelists.get_or_create_singleton(.project_diagnostics);
+        self.clear_find_in_files_results(list.list_id);
+        if (self.project_diagnostics.count() == 0) {
+            const logger = log.logger("diagnostics");
+            defer logger.deinit();
+            logger.print("no diagnostics reported", .{});
+            return;
+        }
+        var it = self.project_diagnostics.iterator();
+        while (it.next()) |kv| for (kv.value_ptr.items) |d|
+            try self.project_diagnostics_add_entry(list.list_id, kv.key_ptr.*, d, .foreground);
+    }
+    pub const show_project_diagnostics_meta: Meta = .{ .description = "Show diagnostics for the whole project" };
 
     pub fn open_previous_file(self: *Self, _: Ctx) Result {
         self.show_file_async(self.get_next_mru_buffer(.all) orelse return error.Stop);

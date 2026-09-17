@@ -46,6 +46,7 @@
             ["ctrl+alt+left", "focus_prev_split"],
             ["alt+shift+l", "focus_filelist"],
             ["ctrl+shift+m", "show_diagnostics"],
+            ["ctrl+alt+m", "show_project_diagnostics"],
             ["ctrl+alt+home", "grow_panel"],
             ["ctrl+shift+alt+home", "grow_panel", 3],
             ["ctrl+alt+end", "shrink_panel"],
