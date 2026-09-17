@@ -29,6 +29,7 @@
             ["<Space>sd", "show_diagnostics"],
             ["<Space>sD", "show_project_diagnostics"],
             ["<Space>ss", "show_symbols"],
+            ["<Space>sS", "workspace_symbol_picker"],
 
             ["<Space>wd", "close_split"],
             ["<Space>wm", "toggle_centered_view"],

@@ -1196,6 +1196,130 @@ fn send_call_error(from: tp.pid_ref, node_id: usize, response: tp.message) void 
     from.send(.{ "CH", "error", node_id, message }) catch {};
 }
 
+// ---- workspace symbols ---------------------------------------------------
+//
+// Results go to `from` (the tui) as "WS" messages tagged with the palette's
+// request id, so answers to a query the user has already typed past are
+// recognisable:
+//
+//   "WS" "symbol" id name container kind path line col
+//   "WS" "done"   id query count
+//   "WS" "error"  id message
+
+fn read_workspace_symbol(raw: []const u8) (error{InvalidWorkspaceSymbol} || RangeError || cbor.Error)!struct {
+    name: []const u8,
+    container: []const u8,
+    kind: u8,
+    uri: []const u8,
+    line: usize,
+    col: usize,
+} {
+    var name: []const u8 = "";
+    var container: []const u8 = "";
+    var kind: u8 = 0;
+    var uri: []const u8 = "";
+    var line: usize = 0;
+    var col: usize = 0;
+    var iter = raw;
+    var len = try cbor.decodeMapHeader(&iter);
+    while (len > 0) : (len -= 1) {
+        var field: []const u8 = undefined;
+        if (!try cbor.matchString(&iter, &field)) return error.InvalidWorkspaceSymbol;
+        if (std.mem.eql(u8, field, "name")) {
+            if (!try cbor.matchValue(&iter, cbor.extract(&name))) return error.InvalidWorkspaceSymbol;
+        } else if (std.mem.eql(u8, field, "containerName")) {
+            if (!try cbor.matchValue(&iter, cbor.extract(&container))) try cbor.skipValue(&iter);
+        } else if (std.mem.eql(u8, field, "kind")) {
+            if (!try cbor.matchValue(&iter, cbor.extract(&kind))) try cbor.skipValue(&iter);
+        } else if (std.mem.eql(u8, field, "location")) {
+            // SymbolInformation has a full Location; WorkspaceSymbol may carry
+            // only the uri and leave the range to a resolve request.
+            var loc = iter;
+            var n = try cbor.decodeMapHeader(&loc);
+            while (n > 0) : (n -= 1) {
+                var loc_field: []const u8 = undefined;
+                if (!try cbor.matchString(&loc, &loc_field)) return error.InvalidWorkspaceSymbol;
+                if (std.mem.eql(u8, loc_field, "uri")) {
+                    if (!try cbor.matchValue(&loc, cbor.extract(&uri))) return error.InvalidWorkspaceSymbol;
+                } else if (std.mem.eql(u8, loc_field, "range")) {
+                    var range_raw: []const u8 = undefined;
+                    if (!try cbor.matchValue(&loc, cbor.extract_cbor(&range_raw))) return error.InvalidWorkspaceSymbol;
+                    const range = try read_range(range_raw);
+                    line = range.start.line;
+                    col = range.start.character;
+                } else try cbor.skipValue(&loc);
+            }
+            iter = loc;
+        } else {
+            try cbor.skipValue(&iter);
+        }
+    }
+    if (uri.len == 0 or name.len == 0) return error.InvalidWorkspaceSymbol;
+    return .{ .name = name, .container = container, .kind = kind, .uri = uri, .line = line, .col = col };
+}
+
+pub fn workspace_symbols(self: *Self, from: tp.pid_ref, query: []const u8, request_id: usize) (LspError || cbor.Error)!void {
+    const handler: struct {
+        from: tp.pid,
+        request_id: usize,
+        query: []const u8,
+
+        pub fn deinit(self_: *@This()) void {
+            std.heap.c_allocator.free(self_.query);
+            self_.from.deinit();
+        }
+
+        pub fn receive(self_: @This(), response: tp.message) !void {
+            const to = self_.from.ref();
+            var result: []const u8 = undefined;
+            var count: usize = 0;
+            defer to.send(.{ "WS", "done", self_.request_id, self_.query, count }) catch {};
+            if (try cbor.match(response.buf, .{ "child", tp.string, "result", tp.null_ })) return;
+            if (!try cbor.match(response.buf, .{ "child", tp.string, "result", tp.extract_cbor(&result) })) {
+                var err_raw: []const u8 = undefined;
+                var message: []const u8 = "the language server returned an error";
+                var code: i64 = 0;
+                if (try cbor.match(response.buf, .{ "child", tp.string, "error", tp.extract_cbor(&err_raw) })) {
+                    var it = err_raw;
+                    var n = cbor.decodeMapHeader(&it) catch 0;
+                    while (n > 0) : (n -= 1) {
+                        var field: []const u8 = undefined;
+                        if (!(cbor.matchString(&it, &field) catch false)) break;
+                        if (std.mem.eql(u8, field, "message")) {
+                            var m: []const u8 = "";
+                            if (cbor.matchValue(&it, cbor.extract(&m)) catch false) {
+                                if (m.len > 0) message = m;
+                            } else cbor.skipValue(&it) catch break;
+                        } else if (std.mem.eql(u8, field, "code")) {
+                            if (!(cbor.matchValue(&it, cbor.extract(&code)) catch false)) cbor.skipValue(&it) catch break;
+                        } else cbor.skipValue(&it) catch break;
+                    }
+                }
+                if (code == -32601) message = "this language server does not support workspace symbols";
+                to.send(.{ "WS", "error", self_.request_id, message }) catch {};
+                return;
+            }
+            var iter = result;
+            var len = try cbor.decodeArrayHeader(&iter);
+            while (len > 0) : (len -= 1) {
+                var raw: []const u8 = undefined;
+                if (!try cbor.matchValue(&iter, cbor.extract_cbor(&raw))) return;
+                const sym = read_workspace_symbol(raw) catch continue;
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const path = file_uri_to_path(sym.uri, &path_buf) catch continue;
+                try to.send(.{ "WS", "symbol", self_.request_id, sym.name, sym.container, sym.kind, path, sym.line, sym.col });
+                count += 1;
+            }
+        }
+    } = .{
+        .from = from.clone(),
+        .request_id = request_id,
+        .query = try std.heap.c_allocator.dupe(u8, query),
+    };
+
+    self.lsp.send_request(self.allocator, "workspace/symbol", .{ .query = query }, handler) catch return error.LspFailed;
+}
+
 pub fn call_hierarchy_prepare(self: *Self, from: tp.pid_ref, source_location: *const SourceLocation) SendGotoRequestError!void {
     const uri = try make_URI(self.allocator, self.project_name, source_location.src.path);
     defer self.allocator.free(uri);

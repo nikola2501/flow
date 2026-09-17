@@ -259,6 +259,7 @@
             ["shift+f11", "toggle_highlight_columns"],
             ["f12", "goto_definition"],
             ["ctrl+shift+o", "show_symbols"],
+            ["alt+shift+o", "workspace_symbol_picker"],
             ["ctrl+space", "completion"],
             ["ctrl+.", "completion"],
             ["f34", "toggle_whitespace_mode"],

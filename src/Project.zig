@@ -1256,6 +1256,12 @@ pub fn references(self: *Self, from: tp.pid_ref, source_location: *const SourceL
     return client.references(from, source_location);
 }
 
+/// `file_path` picks the language server to ask: the one for that file's type.
+pub fn workspace_symbols(self: *Self, from: tp.pid_ref, file_path: []const u8, query: []const u8, request_id: usize) SendGotoRequestError!void {
+    const client = try self.get_lsp_client_for_file(file_path);
+    return client.workspace_symbols(from, query, request_id);
+}
+
 pub fn call_hierarchy_prepare(self: *Self, from: tp.pid_ref, source_location: *const SourceLocation) SendGotoRequestError!void {
     const client = try self.get_lsp_client_for_file(source_location.src.path);
     return client.call_hierarchy_prepare(from, source_location);

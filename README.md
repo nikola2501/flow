@@ -27,6 +27,7 @@ The fork lives on the `diff-against-ref` branch.
 | Changed files list | `show_changed_files [ref]` | `ctrl+alt+c` | `<Space>gc` |
 | All changed hunks | `show_vcs_hunks [ref]` | `ctrl+alt+h` | `<Space>gh` |
 | Project diagnostics | `show_project_diagnostics` | `ctrl+alt+m` | `<Space>sD` |
+| Workspace symbols | `workspace_symbol_picker` | `alt+shift+o` | `<Space>sS` |
 | Call hierarchy, incoming | `show_incoming_calls` | `ctrl+shift+f12` | `<Space>ci` |
 | Call hierarchy, outgoing | `show_outgoing_calls` | `ctrl+alt+f12` | `<Space>co` |
 | Line blame in the browser | `open_vcs_blame_in_browser` | `alt+shift+b` | `<Space>gb` |
@@ -101,6 +102,22 @@ they were told about. flow also does not tell servers when an unopened file
 changes on disk, so those entries update only after the file is opened or saved
 in flow.
 
+### Workspace symbols
+
+`workspace_symbol_picker` searches symbols across the whole project through the
+language server's `workspace/symbol`. The server keeps its own index, so no tag
+files are generated. A row shows the symbol, its file and line, and its
+container or kind. Enter opens the symbol.
+
+The server does the matching, so each change to the query sends a new request.
+One request runs at a time. When it finishes, the query as it stands then is
+sent next, and answers to older queries are dropped. The server is chosen by
+the active file's language, so a file must be open. The same command also
+backs the helix keymap's `space S`. That binding was already in upstream, but
+the command it names did not exist.
+
+Tested with gopls and ols (Odin).
+
 ### Call hierarchy
 
 `show_incoming_calls` opens a tree rooted at the function under the cursor,
@@ -165,7 +182,8 @@ centres the target line and highlights it, and follows the selection.
 |---|---|
 | Diff, changed files, hunks, blame, project diagnostics, buffer numbers | `src/tui/mainview_fork.zig` (its own command collection and a `State` struct) |
 | Hooks into the main view | `src/tui/mainview.zig`: the `fork` field, `fork_commands` init and deinit, two diagnostics calls, five helpers made `pub` |
-| Call hierarchy requests | `src/LSP.zig` (`send_request_raw`), `src/LSPClient.zig`, `src/Project.zig`, `src/project_manager.zig` |
+| Call hierarchy and workspace symbol requests | `src/LSP.zig` (`send_request_raw`), `src/LSPClient.zig`, `src/Project.zig`, `src/project_manager.zig` |
+| Workspace symbol picker | `src/tui/mode/overlay/workspace_symbol_palette.zig`, command in `src/tui/tui.zig` |
 | Call hierarchy tree | `src/tui/mode/overlay/call_hierarchy_palette.zig`, left/right hooks in `palette.zig` |
 | Source preview | `src/tui/FilePreview.zig`, layout in `src/tui/filelist_view.zig` |
 | Buffer open order | `src/buffer/Buffer.zig` (`open_seq`), `src/buffer/Manager.zig` |
@@ -194,7 +212,7 @@ Merge rather than rebase. A merge resolves conflicts once for the whole range.
 A rebase replays each fork commit and can raise the same conflict in several of
 them.
 
-The fork is about 2,000 added lines, and three of its files are entirely new.
+The fork is about 2,500 added lines, and four of its files are entirely new.
 Most of it is in `mainview_fork.zig`. The upstream `mainview.zig` changes by only
 15 lines. That matters because `mainview.zig` is one of the files upstream edits
 most. The rest of the fork's changes are new code added at the end of existing

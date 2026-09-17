@@ -310,6 +310,13 @@ pub fn references(source_location: SourceLocation) (ProjectManagerError || Proje
     return send(.{ "references", project, source_location });
 }
 
+pub fn workspace_symbols(file_path: []const u8, query: []const u8, request_id: usize) (ProjectManagerError || ProjectError)!void {
+    const project = tp.env.get().str("project");
+    if (project.len == 0)
+        return error.NoProject;
+    return send(.{ "workspace_symbols", project, file_path, query, request_id });
+}
+
 pub fn call_hierarchy_prepare(source_location: SourceLocation) (ProjectManagerError || ProjectError)!void {
     const project = tp.env.get().str("project");
     if (project.len == 0)
@@ -616,6 +623,12 @@ const Process = struct {
             self.goto_type_definition(from, project_directory, &source_location) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
         } else if (try cbor.match(m.buf, .{ "references", tp.extract(&project_directory), tp.extract(&source_location) })) {
             self.references(from, project_directory, &source_location) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
+        } else if (try cbor.match(m.buf, .{ "workspace_symbols", tp.extract(&project_directory), tp.extract(&path), tp.more })) {
+            var symbol_query: []const u8 = undefined;
+            var request_id: usize = 0;
+            if (try cbor.match(m.buf, .{ tp.any, tp.any, tp.any, tp.extract(&symbol_query), tp.extract(&request_id) })) {
+                self.workspace_symbols(from, project_directory, path, symbol_query, request_id) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
+            }
         } else if (try cbor.match(m.buf, .{ "call_hierarchy_prepare", tp.extract(&project_directory), tp.extract(&source_location) })) {
             self.call_hierarchy_prepare(from, project_directory, &source_location) catch |e| return from.forward_error(e, @errorReturnTrace()) catch error.ClientFailed;
         } else if (try cbor.match(m.buf, .{ "call_hierarchy_calls", tp.extract(&project_directory), tp.extract(&path), tp.more })) {
@@ -1060,6 +1073,11 @@ const Process = struct {
         defer frame.deinit();
         const project = self.projects.get(project_directory) orelse return error.NoProject;
         return project.references(from, args);
+    }
+
+    fn workspace_symbols(self: *Process, from: tp.pid_ref, project_directory: []const u8, file_path: []const u8, query: []const u8, request_id: usize) (ProjectError || Project.SendGotoRequestError)!void {
+        const project = self.projects.get(project_directory) orelse return error.NoProject;
+        return project.workspace_symbols(from, file_path, query, request_id);
     }
 
     fn call_hierarchy_prepare(self: *Process, from: tp.pid_ref, project_directory: []const u8, args: *const SourceLocation) (ProjectError || Project.SendGotoRequestError)!void {
