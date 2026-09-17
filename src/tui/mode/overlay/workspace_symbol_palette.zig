@@ -81,6 +81,10 @@ fn reset_results(palette: *Type) void {
     palette.total_items = 0;
     palette.menu.reset_items();
     palette.menu.selected = null;
+    // Lay the overlay out now: an async palette is otherwise only sized when a
+    // result arrives, so with no query yet -- as on opening -- the input box
+    // would not appear until the first keystroke brought results.
+    palette.refresh_layout();
 }
 
 fn receive(palette: *Type, _: tp.pid_ref, m: tp.message) MessageFilter.Error!bool {
